@@ -1,0 +1,1057 @@
+---
+title: "Making paper figures"
+author: "Glenn Palmer"
+date: "2025-01-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(Hmisc)
+```
+
+First, I prep the data in the next four sections. Then, I make relevant tables and figures.
+
+(This script was written to be used after running joint_model_factor_k5.Rmd.)
+
+## Theta_i
+
+```{r}
+df_figures <- as.data.frame(theta_postmean)
+theta_names <- t(matrix(c("gamma_RA", "gamma_RN",
+                             "gamma_NA", "gamma_NR",
+                             "alpha_RA", "alpha_RN",
+                             "alpha_NA", "alpha_NR"),
+                           nrow=2, ncol=4))
+names(df_figures)[1:8] <- as.vector(theta_names)
+names(df_figures)[9:10] <- c("phi_R", "phi_N")
+```
+
+## Clustering
+
+```{r}
+# clustering point estimate
+df_figures$cluster <- plot_df$cluster
+
+# type 1 assignment probabilities
+df_figures$type1_cluster1prob <- c1_probs
+df_figures$type1_cluster2prob <- c2_probs
+df_figures$type1_cluster3prob <- c3_probs
+df_figures$type1_cluster4prob <- c4_probs
+
+# type 2 assignment probabilities
+# (Gibbs posterior probability of co-clustering with the point closest to the center of each cluster)
+df_figures$type2_cluster1prob <- co_prob_mat[c1_index,]
+df_figures$type2_cluster2prob <- co_prob_mat[c2_index,]
+df_figures$type2_cluster3prob <- co_prob_mat[c3_index,]
+df_figures$type2_cluster4prob <- co_prob_mat[c4_index,]
+```
+
+
+```{r}
+# print out cluster sizes and centers
+cluster_sizes <- km.out.bayes4$size
+cluster_sizes
+
+cluster_centers <- km.out.bayes4$centers
+colnames(cluster_centers) <- names(df_figures)[1:10]
+cluster_centers
+
+xtable(cluster_centers)
+```
+
+
+
+## EDA PSG variables
+
+```{r}
+get_single_patient_EDA_variables <- function(id_number) {
+  ########### get stage_df and epoch_vec set up correctly ##########
+  
+  # set patient_num
+  patient_num <- id_number
+  
+  # import stage_df
+  stage_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, "STAGE.csv"))
+  names(stage_df) <- c("stage")
+  stage_df <- stage_df |>
+    dplyr::select(stage)
+  
+  # import events df
+  event_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".csv"))
+  names(event_df)<-str_replace_all(names(event_df), c(" " = "." , "," = "" ))
+  
+  # exclude outages from event_df
+  event_df <- event_df |>
+    dplyr::filter(Event.type != "'tech out\",W\"")
+  
+  # Convert sleep stages in event_df to have same format as stage_df
+  event_df <- event_df |>
+    dplyr::mutate(stageval = case_when(
+      Stage == "W" ~ 11,
+      Stage == "R" ~ 12,
+      Stage == "N1" ~ 13,
+      Stage == "N2" ~ 14,
+      Stage == "N3" ~ 15
+    ))
+  
+  # create epoch counter vector -- first epoch 29 seconds
+  epoch_vec <- c(rep(1,29), rep(2:1500, each=30))
+  
+  # pull out stage_vec from stage_df
+  stage_vec <- stage_df$stage
+  
+  # check that the transitions in sleep stages and epochs are lined up
+  stage_vec <- check_and_prepend_alignment(stage_vec)
+  
+  # loop over event stage/epoch pairs and make sure they're aligned
+  eventstage_vec <- as.numeric(event_df$stageval)
+  eventepoch_vec <- as.numeric(event_df$Epoch)
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align != 0) {
+    stage_vec <- 
+      align_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  } 
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align == 0) {
+    print("Epoch and stage alignment successful!")
+  }
+  if (check_align != 0) {
+    print(paste0("Epoch and stage alignment failed for patient ", patient_num, "."))
+    return(1)
+  }
+  
+  
+  # Add values to end of a few patients requiring it
+  if (patient_num %in% c(250145, 440032, 450071, 450098)) {
+    stage_vec <- c(stage_df$stage, 14)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }
+  if (patient_num %in% c(440048)) {
+    stage_vec <- c(stage_df$stage, 13)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }  
+  
+  
+  
+  #### Get apnea events aligned and added
+  
+  # filter event_df for apnea events
+  event_df <- event_df |>
+    filter(Event.type == "Hypopnea" | Event.type == "Obstructive apnea" | Event.type == "Central apnea" | Event.type == "Mixed apnea")
+  
+  # Some patients have times using AM/PM -- convert as needed
+  if (patient_num == 240094) {
+    for (i in 1:nrow(event_df)) {
+      # super messy way to convert am/pm to military time string
+      event_df$Time[i] <- substring(as.character(parse_date_time(event_df$Time[i],
+                                                                 '%I:%M:%S %p')),
+                                    nchar(as.character(parse_date_time(event_df$Time[i],
+                                                                       '%I:%M:%S %p'))) - 8 + 1)
+    }
+    event_df$Time <- hms(event_df$Time)
+  }
+  
+  # import start time from edf file
+  starttime <- readEdfHeader(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".edf"))$startTime
+  
+  # put start_time in same format as other fake times
+  starttime_vec <- c(NA, 1)
+  if (hour(starttime) > 16) {
+    starttime_vec[1] <- ISOdate(year=1, month=1, day=1,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime))
+  }
+  if (hour(starttime) <= 16) {
+    starttime_vec[1] <- c(ISOdate(year=1, month=1, day=2,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime)))
+  }
+  starttime <- starttime_vec[1]
+  
+  # make event_time and event_faketime vectors and populate
+  event_time <- event_df$Time
+  event_faketime <- rep(NA, length(event_time))
+  for (i in 1:length(event_time)) {
+    if (hour(event_time[i]) > 16 & patient_num != 140095) {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=1,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+    else {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=2,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+  }
+  
+  # compute event index
+  event_index <- event_faketime - starttime
+  
+  # check that events are placed in correct epochs
+  eventepoch_vec <- event_df$Epoch
+  for (i in 1:length(event_index)) {
+    #print(paste0("Checking event ", i, "."))
+    if (event_index[i] == 0) {
+      if (eventepoch_vec[i] != 1) {
+        print(paste0("Incorrect epoch for event ", i, "."))
+        return(1)
+      }
+    }
+    else if (epoch_vec[event_index[i]] != eventepoch_vec[i]) {
+      print(paste0("Incorrect epoch for event ", i, "."))
+      return(1)
+    }
+  }
+  
+  # get durations
+  event_durations <- as.integer(ceiling(as.numeric(word(event_df$Duration, 1))))
+  
+  # create binary vector with indicator of event currently happening
+  event_happening <- rep(0, length(stage_vec))
+  for (i in 1:length(event_index)) {
+    if (event_index[i] != 0) {
+    event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,event_durations[i])
+    }
+    else {
+      event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,(event_durations[i] - 1))
+    }
+  }
+  # cut off final indices of event_happening if it goes beyond the length of stage_vec
+  event_happening <- event_happening[1:length(stage_vec)]
+  
+  
+  # create counter vector for cumulative number of events
+  cum_event_vec <- rep(NA, length(stage_vec))
+  curr_count <- 0
+  for (i in 1:length(stage_vec)) {
+    if (event_happening[i] == 1) {
+      if (i == 1) {
+        curr_count <- curr_count + 1
+      }
+      else if (event_happening[i-1] == 0) {
+        curr_count <- curr_count + 1
+      }
+    }
+    cum_event_vec[i] <- curr_count
+  }
+  
+  # create updated stage_df
+  stage_df <- data.frame(stage_vec, epoch_vec[1:length(stage_vec)], event_happening, cum_event_vec)
+  names(stage_df) <- c("stage", "epoch", "event", "cum_events")  
+  
+  
+  
+  # proceed as usual
+  
+  # Collapse non-REM stages
+  stage_df <- stage_df |>
+    mutate(stage = case_when(
+      stage == 11 ~ 11,
+      stage == 12 ~ 12,
+      stage >= 13 ~ 13
+    ))
+  
+  # update stage_vec
+  stage_vec <- stage_df$stage
+  
+  # At this point, stage_df provides enough to get the necessary info for modeling interevent times
+  qR <- 0 # number of seconds spent in REM (excluding time during events except the second of onset)
+  vR <- 0 # number of apnea/hypopnea events in REM
+  qN <- 0 # number of seconds spend in non-REM sleep (excluding time during events except the second of onset)
+  vN <- 0 # number of apnea/hypopnea events in non-REM sleep
+  
+  # EDA variables
+  tR <- 0 # total time in REM sleep (including during events)
+  tN <- 0 # total time in non-REM sleep (including during events)
+  event_length_vec_R <- c() # event durations for events that start during REM sleep
+  event_length_vec_N <- c() # event durations for events that start during non-REM sleep
+  
+  # helper variables
+  curr_event_length <- 0 # counter for the length of the current event
+  curr_event_stage <- "NA" # indicator for which sleep stage the current event started in
+  
+  
+  # loop over the dataframe and increment the above quantities
+  for (i in 2:nrow(stage_df)) {
+    if (stage_vec[i] == 12) {
+      qR <- qR + 1
+      tR <- tR + 1
+      if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+        vR <- vR + 1
+        curr_event_length <- 1
+        curr_event_stage <- "REM"
+      }
+      else if (event_happening[i] == 1) {
+        qR <- qR - 1
+        curr_event_length <- curr_event_length + 1
+      }
+    }
+    else if (stage_vec[i] == 13) {
+      qN <- qN + 1
+      tN <- tN + 1
+      if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+        vN <- vN + 1
+        curr_event_length <- 1
+        curr_event_stage <- "non-REM"
+      }
+      else if (event_happening[i] == 1) {
+        qN <- qN - 1
+        curr_event_length <- curr_event_length + 1
+      }
+    }
+    if (event_happening[i] == 0 & event_happening[i-1] == 1) {
+      if (curr_event_stage == "REM") {
+        event_length_vec_R <- c(event_length_vec_R, curr_event_length)
+        curr_event_length <- 0
+      }
+      else if (curr_event_stage == "non-REM") {
+        event_length_vec_N <- c(event_length_vec_N, curr_event_length)
+        curr_event_length <- 0
+      }
+    }
+  }
+  
+  qR
+  vR
+  qN
+  vN
+  
+  # summary variables of event lengths
+  length_mean_R <- mean(event_length_vec_R)
+  length_mean_N <- mean(event_length_vec_N)
+  length_median_R <- median(event_length_vec_R)
+  length_median_N <- median(event_length_vec_N)
+  
+  # collapse stage_df to epoch-level
+  stage_epoch_df <- stage_df |>
+    group_by(epoch) |>
+    #summarize(stage=mean(stage), event=(n_distinct(event) - 1))
+    summarize(stage=mean(stage), event=(sum(event) > 0))
+  
+  # add a next-stage variable and a cumulative events variable
+  stage_epoch_df$next_stage <- c(stage_epoch_df$stage[2:nrow(stage_epoch_df)], NA)
+  
+  # summarize counts of all combinations of stage, next_stage, and event -- EDITED FOR ONLY 3 STAGES
+  stage_transition_counts <- data.frame(rep(12:13, each=6),
+                                        rep(rep(11:13, each=2), 2),
+                                        rep(c(0,1), 6))
+  names(stage_transition_counts) <- c("stage", "next_stage", "event")
+  
+  # count observed transitions
+  stage_transition_observed <- stage_epoch_df |>
+    group_by(stage, next_stage, event) |>
+    count() |>
+    filter(!is.na(next_stage) & stage != 11)
+  
+  # merge counts with all combinations
+  stage_transition_counts <- stage_transition_counts |>
+    left_join(stage_transition_observed)
+  
+  # recode unobserved combinations as zero counts
+  for (i in 1:nrow(stage_transition_counts)) {
+    if (is.na(stage_transition_counts$n[i])) {
+      stage_transition_counts$n[i] <- 0
+    }
+  }
+  
+
+  
+  
+  
+  # create Y matrix for the current patient
+  Y_event_curr <- c(qR,vR,qN,vN,
+                    tR,tN,
+                    length_mean_R,length_mean_N,
+                    length_median_R,length_median_N)
+  
+  Y_curr <- matrix(rep(NA, 12), ncol=3)
+  Y_curr[1,] <- stage_transition_counts$n[c(1,3,5)]
+  Y_curr[2,] <- stage_transition_counts$n[c(2,4,6)]
+  Y_curr[3,] <- stage_transition_counts$n[c(7,9,11)]
+  Y_curr[4,] <- stage_transition_counts$n[c(8,10,12)]
+  
+  # also return longest event
+  longest_duration <- max(event_durations)
+  
+  # return data
+  return(list(Y_curr, Y_event_curr, longest_duration))
+}
+```
+
+```{r}
+# check to see if it's working -- seems right
+get_single_patient_EDA_variables(140014)
+```
+
+```{r}
+# loop over multiple patients to get Y, X, and Z
+get_multiple_patient_EDA_data <- function(id_numbers) {
+  N <- length(id_numbers)
+  longest_event <- rep(NA, length(id_numbers))
+  
+  # import first patient
+  print(paste0("Importing patient id ", id_numbers[1], "(Patient ", 1, ")"))
+  Y <- get_single_patient_EDA_variables(id_numbers[1])[[1]]
+  Y_event <- get_single_patient_EDA_variables(id_numbers[1])[[2]]
+  longest_event[1] <- get_single_patient_EDA_variables(id_numbers[1])[[3]]
+  
+  # loop over the rest of them
+  for (i in 2:N) {
+    print(paste0("Importing patient id ", id_numbers[i], "(Patient ", i, ")"))
+    curr_data <- get_single_patient_EDA_variables(id_numbers[i])
+    Y <- rbind(Y, curr_data[[1]])
+    Y_event <- rbind(Y_event, curr_data[[2]])
+    longest_event[i] <- curr_data[[3]]
+  }
+  
+  # make X matrix
+  XZ_single <- t(matrix(c(1,0,0,0,
+                     1,0,1,0,
+                     0,1,0,0,
+                     0,1,0,1), ncol=4))
+  
+  X <- kronecker(matrix(rep(1,N), nrow=N), XZ_single)
+  Z <- kronecker(diag(N), XZ_single)
+  
+  # return the results
+  return(Y_event)
+}
+```
+
+
+```{r message=FALSE}
+# Import EDA variables for all patients
+Y_event_EDA <- get_multiple_patient_EDA_data(patient_ids)
+```
+
+```{r}
+# add variables to df
+df_figures$num_events_REM <- Y_event_EDA[,2]
+df_figures$num_events_nonREM <- Y_event_EDA[,4]
+df_figures$time_in_REM <- Y_event_EDA[,5] / 3600 # in hours
+df_figures$time_in_nonREM <- Y_event_EDA[,6] / 3600 # in hours
+df_figures$mean_event_duration_REM <- Y_event_EDA[,7] # in seconds
+df_figures$mean_event_duration_nonREM <- Y_event_EDA[,8] # in seconds
+df_figures$median_event_duration_REM <- Y_event_EDA[,9] # in seconds
+df_figures$median_event_duration_nonREM <- Y_event_EDA[,10] # in seconds
+```
+
+```{r}
+# compute related variables
+df_figures <- df_figures |>
+  mutate(total_sleep = time_in_REM + time_in_nonREM) |>
+  mutate(total_events = num_events_REM + num_events_nonREM) |>
+  mutate(AHI = total_events / total_sleep) |>
+  mutate(AHI_REM = num_events_REM / time_in_REM) |>
+  mutate(AHI_nonREM = num_events_nonREM / time_in_nonREM) |>
+  mutate(time_asleep = time_in_REM + time_in_nonREM)
+```
+
+## Demographic variables
+
+```{r}
+# add patient id
+df_figures$patient_id <- patient_ids
+```
+
+```{r}
+# add demographic covariates
+AHI <- rep(NA, N)
+age_at_enrollment <- rep(NA, N)
+sex <- rep(NA, N)
+HighestGradeHP <- rep(NA, N)
+APPLEID <- rep(NA, N)
+race <- rep(NA, N)
+BMI <- rep(NA, N)
+for (i in 1:N) {
+  row_index <- which(covariate_df$fileid == paste0("apples-", patient_ids[i]))
+  AHI[i] <- covariate_df$nsrr_ahi_chicago1999[row_index]
+  age_at_enrollment[i] <- covariate_df$age_at_enrollment[row_index]
+  HighestGradeHP[i] <- covariate_df$HighestGradeHP[row_index]
+  sex[i] <- covariate_df$nsrr_sex[row_index]
+  APPLEID[i] <- covariate_df$nsrrid[row_index]
+  race[i] <- covariate_df$Ethnicity[row_index]
+  BMI[i] <- covariate_df$BMIBLQuan[row_index]
+}
+df_figures$AHI <- AHI
+df_figures$age_at_enrollment <- age_at_enrollment
+df_figures$HighestGradeHP <- HighestGradeHP
+df_figures$sex <- sex
+df_figures$APPLEID <- APPLEID
+df_figures$race <- race
+df_figures$BMI <- BMI
+```
+
+```{r}
+# add binary variables for male and white
+df_figures <- df_figures |>
+  mutate(isWhite = if_else(
+    race == "4) White", 1, 0
+  )) |>
+  mutate(isMale = if_else(
+    sex == "male", 1, 0
+  ))
+```
+
+
+```{r}
+##### add Pathfinder and BSRT ######
+
+# import the test result df
+test_df <- read_csv("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/CSV Exports from APPLES Investigator Database/APPLES BSRT PFN SWMT MWT PASAT Longitudinal Data.csv")
+
+# filter to only include diagnostic results
+test_df <- test_df |>
+  dplyr::filter(Visit=="DX")
+
+# sleepiness covariate from baseline df
+PFNTOTL <- rep(NA, nrow(df_figures))
+BSRT_SumRecall <- rep(NA, nrow(df_figures))
+for (i in 1:nrow(df_figures)) {
+  row_index <- which(test_df$APPLEID == df_figures$APPLEID[i])
+  PFNTOTL[i] <- test_df$PFNTOTL[row_index]
+  BSRT_SumRecall[i] <- test_df$SumRecall[row_index]
+}
+
+# add vectors to df
+df_figures$PFNTOTL <- PFNTOTL
+df_figures$BSRT_SumRecall <- BSRT_SumRecall
+```
+```{r}
+# add first pc scores (dynamics only)
+
+# print pc vectors
+pca_RE_dynamics$rotation
+
+# add first pc score to df
+df_figures$pc1_dynamics <- pca_RE_dynamics$x[,1]
+```
+
+
+
+############# Make plots!! ###############
+
+# EDA boxplots
+
+```{r}
+# AHI
+ggplot(data=rbind(df_figures, df_figures, df_figures),
+       aes(x=rep(c("Total", "REM", "nonREM"), each=nrow(df_figures)),
+           y=c(df_figures$AHI, df_figures$AHI_REM, df_figures$AHI_nonREM))) +
+  geom_boxplot() +
+  labs(x="Sleep Stage",
+       y="Patient AHI",
+       title="Distribution of AHI values")
+```
+
+
+
+```{r}
+# event durations
+ggplot(data=rbind(df_figures, df_figures),
+       aes(x=rep(c("REM", "nonREM"), each=nrow(df_figures)),
+           y=c(df_figures$mean_event_duration_REM, df_figures$mean_event_duration_nonREM))) +
+  geom_boxplot() +
+  ylim(0,100) +
+  labs(x="Sleep Stage",
+       y="Patient Mean Event Duration (seconds)",
+       title="Distribution of Mean Apnea/Hypopnea Lengths")
+
+# four points not shown: 2 people with zero events during REM, 2 outliers in REM (219 and 188 seconds)
+sort(df_figures$mean_event_duration_REM, decreasing=TRUE)[1:2]
+```
+```{r}
+# time asleep
+ggplot(data=rbind(df_figures, df_figures, df_figures),
+       aes(x=rep(c("Total Sleep Time", "REM", "nonREM"), each=nrow(df_figures)),
+           y=c(df_figures$time_asleep, df_figures$time_in_REM, df_figures$time_in_nonREM))) +
+  geom_boxplot() +
+  labs(x="Sleep Stage",
+       y="Time In Sleep Stage",
+       title="Time Asleep in REM and non-REM")
+```
+
+
+
+# Principal components to choose k
+
+```{r}
+theta_pca <- princomp(df_figures[,1:10])
+summary(theta_pca)
+```
+```{r}
+library(factoextra)
+fviz_eig(theta_pca, addlabels=TRUE,
+         title="Percentage of variance explained by each principal component of theta_i",
+         subtitle="Principal components computed using posterior means")
+```
+
+
+# Clustering figures
+
+```{r}
+# plot clusters on scatterplot of principal components
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=cluster)) +
+  geom_point() +
+  labs(title="Bayes-optimal clustering",
+       x="pc1")
+```
+
+```{r}
+# assignment probability plots -- Type 1
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster1prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster2prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Type 1 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster3prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 3 -- Type 1 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster4prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Type 1 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+```
+```{r}
+# assignment probability plots -- Type 2
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster1prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster2prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster3prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 3 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster4prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+```
+
+
+# Clustering UQ comparison
+
+```{r}
+# add a variable for the probabilities of being assigned to the cluster point estimate
+df_figures <- df_figures |>
+  mutate(prob_assigned_type1 = case_when(
+    cluster == "1" ~ type1_cluster1prob,
+    cluster == "2" ~ type1_cluster2prob,
+    cluster == "3" ~ type1_cluster3prob,
+    cluster == "4" ~ type1_cluster4prob
+  )) |>
+  mutate(prob_assigned_type2 = case_when(
+    cluster == "1" ~ type2_cluster1prob,
+    cluster == "2" ~ type2_cluster2prob,
+    cluster == "3" ~ type2_cluster3prob,
+    cluster == "4" ~ type2_cluster4prob
+  ))
+```
+
+```{r}
+# make dataframe for plotting
+sorted_type1_prob <- df_figures$prob_assigned_type1[order(df_figures$prob_assigned_type2)]
+sorted_type2_prob <- df_figures$prob_assigned_type2[order(df_figures$prob_assigned_type2)]
+df_compare_uq <- data.frame(1:nrow(df_figures),
+                            rep(c("Type 1", "Type 2"), each=nrow(df_figures)),
+                            c(sorted_type1_prob, sorted_type2_prob))
+names(df_compare_uq) <- c("Patient", "UQ_Type", "Prob_Assigned")
+
+# make plot
+ggplot(df_compare_uq, aes(x=Patient, y=Prob_Assigned, color=UQ_Type)) +
+  geom_point() +
+  labs(title="Cluster assignment probabilities -- Type 1 vs. 2 uncertainty",
+       x="Patient index (sorted by increasing Type 2 assignment probability)",
+       y="Probability of assigned cluster")
+
+# scatter plot instead
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=total_sleep)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="red",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  scale_color_continuous(type="viridis")
+
+
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=time_in_REM)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="red",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  scale_color_continuous(type="viridis")
+
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=cluster)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="black",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  labs(title="Probability of assignment to cluster point estimate",
+       x="Type 1 assignment probability",
+       y="Type 2 assignment probability")
+
+```
+
+
+# Other variables by cluster (weighted and unweighted)
+
+```{r}
+# summarize cluster centers
+
+# cluster 1
+colMeans((df_figures |> filter(cluster=="1"))[,1:10])
+
+# cluster 2
+colMeans((df_figures |> filter(cluster=="2"))[,1:10])
+
+# cluster 3
+colMeans((df_figures |> filter(cluster=="3"))[,1:10])
+
+# cluster 4
+colMeans((df_figures |> filter(cluster=="4"))[,1:10])
+
+```
+
+```{r}
+# summarize other variables -- note: this is doing something funky (removing rows based on missingness for a single column?)
+# (the AHI values change based on what other variables are included)
+# (should just compute one column at a time)
+
+# cluster 1
+colMeans((df_figures |> filter(cluster=="1"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
+
+# cluster 2
+colMeans((df_figures |> filter(cluster=="2"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
+
+# cluster 3
+colMeans((df_figures |> filter(cluster=="3"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
+
+# cluster 4
+colMeans((df_figures |> filter(cluster=="4"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
+
+```
+
+```{r}
+# summarize other variables
+
+# AHI
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(AHI), sd(AHI))
+
+# age_at_enrollment
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(age_at_enrollment), sd(age_at_enrollment))
+
+# PFNTOTL
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(PFNTOTL), sd(PFNTOTL))
+
+# BSRT_SumRecall
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(BSRT_SumRecall), sd(BSRT_SumRecall))
+
+# isMale
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(isMale), sd(isMale))
+
+# isWhite
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(isWhite), sd(isWhite))
+
+# BMI
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(BMI), sd(BMI))
+
+# total_sleep
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(total_sleep), sd(total_sleep))
+
+# time_in_REM
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(time_in_REM), sd(time_in_REM))
+
+# time_in_nonREM
+df_figures |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarize(mean(time_in_nonREM), sd(time_in_nonREM))
+
+```
+
+```{r}
+# Weighted average by probability of being in each cluster
+
+# AHI
+print("AHI weighted mean:")
+sum(df_figures$AHI * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$AHI * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$AHI * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$AHI * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("AHI weighted sd")
+sqrt(wtd.var(x=df_figures$AHI, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$AHI, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$AHI, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$AHI, weights=df_figures$type1_cluster4prob))
+
+# age_at_enrollment
+print("age_at_enrollment weighted mean:")
+sum(df_figures$age_at_enrollment * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$age_at_enrollment * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$age_at_enrollment * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$age_at_enrollment * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("age_at_enrollment weighted sd")
+sqrt(wtd.var(x=df_figures$age_at_enrollment, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$age_at_enrollment, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$age_at_enrollment, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$age_at_enrollment, weights=df_figures$type1_cluster4prob))
+
+# PFNTOTL
+print("PFNTOTL weighted mean:")
+sum(df_figures$PFNTOTL * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$PFNTOTL * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$PFNTOTL * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$PFNTOTL * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("PFNTOTL weighted sd")
+sqrt(wtd.var(x=df_figures$PFNTOTL, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$PFNTOTL, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$PFNTOTL, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$PFNTOTL, weights=df_figures$type1_cluster4prob))
+
+# BSRT_SumRecall
+print("BSRT_SumRecall weighted mean:")
+sum(df_figures$BSRT_SumRecall * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$BSRT_SumRecall * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$BSRT_SumRecall * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$BSRT_SumRecall * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("BSRT_SumRecall weighted sd")
+sqrt(wtd.var(x=df_figures$BSRT_SumRecall, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$BSRT_SumRecall, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$BSRT_SumRecall, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$BSRT_SumRecall, weights=df_figures$type1_cluster4prob))
+
+# isMale
+print("isMale weighted mean:")
+sum(df_figures$isMale * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$isMale * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$isMale * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$isMale * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("isMale weighted sd")
+sqrt(wtd.var(x=df_figures$isMale, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$isMale, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$isMale, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$isMale, weights=df_figures$type1_cluster4prob))
+
+# isWhite
+print("isWhite weighted mean:")
+sum(df_figures$isWhite * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$isWhite * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$isWhite * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$isWhite * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("isWhite weighted sd")
+sqrt(wtd.var(x=df_figures$isWhite, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$isWhite, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$isWhite, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$isWhite, weights=df_figures$type1_cluster4prob))
+
+# BMI
+print("BMI weighted mean:")
+sum(df_figures$BMI * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$BMI * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$BMI * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$BMI * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("BMI weighted sd")
+sqrt(wtd.var(x=df_figures$BMI, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$BMI, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$BMI, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$BMI, weights=df_figures$type1_cluster4prob))
+
+# total_sleep
+print("total_sleep weighted mean:")
+sum(df_figures$total_sleep * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$total_sleep * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$total_sleep * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$total_sleep * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("total_sleep weighted sd")
+sqrt(wtd.var(x=df_figures$total_sleep, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$total_sleep, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$total_sleep, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$total_sleep, weights=df_figures$type1_cluster4prob))
+
+# time_in_REM
+print("time_in_REM weighted mean:")
+sum(df_figures$time_in_REM * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$time_in_REM * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$time_in_REM * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$time_in_REM * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("time_in_REM weighted sd")
+sqrt(wtd.var(x=df_figures$time_in_REM, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$time_in_REM, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$time_in_REM, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$time_in_REM, weights=df_figures$type1_cluster4prob))
+
+# time_in_nonREM
+print("time_in_nonREM weighted mean:")
+sum(df_figures$time_in_nonREM * df_figures$type1_cluster1prob) / sum(df_figures$type1_cluster1prob)
+sum(df_figures$time_in_nonREM * df_figures$type1_cluster2prob) / sum(df_figures$type1_cluster2prob)
+sum(df_figures$time_in_nonREM * df_figures$type1_cluster3prob) / sum(df_figures$type1_cluster3prob)
+sum(df_figures$time_in_nonREM * df_figures$type1_cluster4prob) / sum(df_figures$type1_cluster4prob)
+print("time_in_nonREM weighted sd")
+sqrt(wtd.var(x=df_figures$time_in_nonREM, weights=df_figures$type1_cluster1prob))
+sqrt(wtd.var(x=df_figures$time_in_nonREM, weights=df_figures$type1_cluster2prob))
+sqrt(wtd.var(x=df_figures$time_in_nonREM, weights=df_figures$type1_cluster3prob))
+sqrt(wtd.var(x=df_figures$time_in_nonREM, weights=df_figures$type1_cluster4prob))
+```
+
+
+```{r}
+# visualize clusters against REM and non-REM AHI -- doesn't capture cluster 2 at all
+ggplot(df_figures, aes(x=AHI_REM, y=AHI_nonREM, color=cluster)) +
+  geom_point()
+
+# how about time in REM and non-REM
+ggplot(df_figures, aes(x=time_in_REM, y=time_in_nonREM, color=cluster)) +
+  geom_point()
+```
+
+
+
+
+# Regression of pathfinder and bsrt on cluster
+
+
+```{r}
+df_pfn <- df_figures |>
+  filter(PFNTOTL > 0)
+df_pfn <- within(df_pfn, cluster <- relevel(cluster, ref=4))
+summary(lm(PFNTOTL ~ cluster + age_at_enrollment + isMale, data=df_pfn))
+
+df_bsrt <- df_figures |>
+  filter(BSRT_SumRecall > 0)
+df_bsrt <- within(df_bsrt, cluster <- relevel(cluster, ref=4))
+summary(lm(BSRT_SumRecall ~ cluster + age_at_enrollment + isMale, data=df_bsrt))
+```
+
+```{r}
+# compared to the same regressions on AHI
+
+summary(lm(PFNTOTL ~ age_at_enrollment + isMale + AHI, data=df_pfn))
+
+summary(lm(BSRT_SumRecall ~ AHI + age_at_enrollment + isMale, data=df_bsrt))
+```
+
+
+
+```{r}
+# adding highest grade (complete case)
+df_pfn <- df_figures |>
+  filter(PFNTOTL > 0)
+df_pfn <- within(df_pfn, cluster <- relevel(cluster, ref=4))
+summary(lm(PFNTOTL ~ age_at_enrollment + isMale + cluster, data=df_pfn))
+
+df_bsrt_grade <- df_figures |>
+  filter(BSRT_SumRecall > 0) |>
+  filter(HighestGradeHP > 0)
+df_bsrt_grade <- within(df_bsrt_grade, cluster <- relevel(cluster, ref=4))
+summary(lm(BSRT_SumRecall ~ age_at_enrollment + isMale + HighestGradeHP + cluster, data=df_bsrt_grade))
+```
+
+
+```{r}
+##### cluster by time and AHI in REM and non-REM
+
+alt_cluster_mat <- matrix(data=c(df_figures$AHI_REM,
+                                 df_figures$AHI_nonREM,
+                                 df_figures$time_in_REM,
+                                 df_figures$time_in_nonREM),
+                          ncol=4)
+
+
+# run k-means using posterior means
+alt_clusters <- kmeans(alt_cluster_mat, centers=4, nstart=50)
+alt_cluster_labels <- as.factor(alt_clusters$cluster)
+alt_cluster_labels
+alt_clusters$size
+alt_clusters$centers
+```
+
+
+```{r}
+# add the alt clusters to the data and try regression
+df_figures$alt_cluster_labels <- alt_cluster_labels
+```
+
+```{r}
+df_figures_lm <- within(df_figures, alt_cluster_labels <- relevel(alt_cluster_labels, ref=4))
+summary(lm(BSRT_SumRecall ~ age_at_enrollment + sex + alt_cluster_labels, data=df_figures_lm))
+```
+
+
+```{r}
+# plot alternate clusters on scatterplot of principal components
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=alt_cluster_labels)) +
+  geom_point() +
+  labs(title="Alternate simple clustering",
+       x="pc1",
+       color="cluster")
+```
+
+
+
+
+

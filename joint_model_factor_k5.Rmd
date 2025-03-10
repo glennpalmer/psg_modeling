@@ -1,0 +1,1664 @@
+---
+title: "Joint model -- factor model covariance (5 factors)"
+author: "Glenn Palmer"
+date: "2024-12-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rstan)
+library(shinystan)
+library(scales)
+library(viridis)
+library(ggcorrplot)
+library(multcomp)
+library(lubridate)
+library(chron)
+library(edfReader)
+library(xtable)
+library(stats)
+library(infinitefactor)
+library(coda)
+library(sns)
+```
+
+## R Markdown
+
+Trying a factor model covariance for the random effects.
+
+
+```{r}
+# import harmonized data
+covariate_df <- read_csv("/Users/glennpalmer/Desktop/sleep_research_2024/apples/datasets/apples-harmonized-dataset-0.1.0.csv")
+
+# just keep the rows describing the PSG visit
+covariate_df <- covariate_df |>
+  filter(!is.na(fileid))
+
+# import baseline characteristics
+baseline_df <- read_csv("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/CSV Exports from APPLES Investigator Database/APPLES Baseline Characteristics.csv")
+
+# merge the datasets, keeping only the subjects in the covariate data
+covariate_df <- covariate_df |>
+  left_join(baseline_df, by=c(nsrrid="APPLEID"))
+```
+
+Now, go through the individual PSG summaries to get counts of seconds in non-REM and REM sleep,
+and #events in non-REM and REM sleep.
+
+
+```{r}
+##### helper functions
+
+# check that transitions are lined up in two vectors
+check_alignment <- function(svec) {
+  transition_align <- which(svec[2:length(svec)] - svec[1:(length(svec)-1)] != 0)[1] %% 30
+  return(transition_align)
+}
+
+# add digits to beginning of vector to make the transitions line up
+check_and_prepend_alignment <- function(svec) {
+  a <- check_alignment(svec)
+  if (a != 29) {
+    new_svec <- c(rep(svec[1], (29-a)), svec)
+    print(paste0("Adding ", (29-a), " indices to beginning of stage_vec for alignment."))
+    return(new_svec)
+  }
+  return(svec)
+}
+
+# try to align stages and epoch pairs to those noted in event_vec
+align_epoch_stage_pairs <- function(svec, evec, svec_event, evec_event, addlimit=20) {
+  addcount <- 0
+  for (i in 1:(length(evec_event)-70)) {
+    if (svec[30*evec_event[i] - 29] != svec_event[i]) {
+      svec <- c(rep(11,29), svec[1], svec)
+      addcount <- addcount + 1
+    }
+    if (addcount > addlimit) {
+      print(paste0("Added more than ", addlimit,  " epochs -- check alignment manually."))
+      return(svec)
+    }
+  }
+  print(paste0("Successfully added ", addcount, " epochs to start of stage vector."))
+  return(svec)
+}
+
+# check that all stages and epochs are aligned
+check_epoch_stage_pairs <- function(svec, evec, svec_event, evec_event) {
+  # note -- leaving out the final handful of epochs to avoid weird issues
+  for (i in 1:(length(evec_event)-70)) {
+    #print(paste0("Checking event epoch ", i, "."))
+    if (svec[30*evec_event[i] - 29] != svec_event[i]) {
+      print("Epochs and stages are misaligned")
+      return(1)
+    }
+  }
+  return(0)
+}
+
+```
+
+
+
+
+```{r}
+########### get stage_df and epoch_vec set up correctly ##########
+
+# start with 130001
+patient_index <- 30
+#patient_num <- patient_ids[patient_index]
+patient_num <- 550178
+stage_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, "STAGE.csv"))
+names(stage_df) <- c("stage")
+stage_df <- stage_df |>
+  dplyr::select(stage)
+
+# import events df
+event_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".csv"))
+names(event_df)<-str_replace_all(names(event_df), c(" " = "." , "," = "" ))
+
+# exclude outages from event_df
+event_df <- event_df |>
+  dplyr::filter(Event.type != "'tech out\",W\"")
+
+# Convert sleep stages in event_df to have same format as stage_df
+event_df <- event_df |>
+  dplyr::mutate(stageval = case_when(
+    Stage == "W" ~ 11,
+    Stage == "R" ~ 12,
+    Stage == "N1" ~ 13,
+    Stage == "N2" ~ 14,
+    Stage == "N3" ~ 15
+  ))
+
+# create epoch counter vector -- first epoch 29 seconds
+epoch_vec <- c(rep(1,29), rep(2:1500, each=30))
+
+# pull out stage_vec from stage_df
+stage_vec <- stage_df$stage
+
+# check that the transitions in sleep stages and epochs are lined up
+stage_vec <- check_and_prepend_alignment(stage_vec)
+
+# loop over event stage/epoch pairs and make sure they're aligned
+eventstage_vec <- as.numeric(event_df$stageval)
+eventepoch_vec <- as.numeric(event_df$Epoch)
+check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+if (check_align != 0) {
+  stage_vec <- 
+    align_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+} 
+check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+if (check_align == 0) {
+  print("Epoch and stage alignment successful!")
+}
+
+
+# Add values to end of a few patients requiring it
+if (patient_num %in% c(250145, 440032, 450071, 450098)) {
+  stage_vec <- c(stage_df$stage, 14)
+  stage_df <- data.frame(stage_vec)
+  names(stage_df) <- c("stage")
+}
+if (patient_num %in% c(440048)) {
+  stage_vec <- c(stage_df$stage, 13)
+  stage_df <- data.frame(stage_vec)
+  names(stage_df) <- c("stage")
+}
+```
+
+```{r}
+#### Get apnea events aligned and added
+
+# filter event_df for apnea events
+event_df <- event_df |>
+  filter(Event.type == "Hypopnea" | Event.type == "Obstructive apnea" | Event.type == "Central apnea" | Event.type == "Mixed apnea")
+
+# Some patients have times using AM/PM -- convert as needed
+if (patient_num == 240094) {
+  for (i in 1:nrow(event_df)) {
+    # super messy way to convert am/pm to military time string
+    event_df$Time[i] <- substring(as.character(parse_date_time(event_df$Time[i],
+                                                               '%I:%M:%S %p')),
+                                  nchar(as.character(parse_date_time(event_df$Time[i],
+                                                                     '%I:%M:%S %p'))) - 8 + 1)
+  }
+  event_df$Time <- hms(event_df$Time)
+}
+
+# import start time from edf file
+starttime <- readEdfHeader(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".edf"))$startTime
+
+# put start_time in same format as other fake times
+starttime_vec <- c(NA, 1)
+if (hour(starttime) > 16) {
+  starttime_vec[1] <- ISOdate(year=1, month=1, day=1,
+                       hour=hour(starttime),
+                       min=minute(starttime),
+                       sec=second(starttime))
+}
+if (hour(starttime) <= 16) {
+  starttime_vec[1] <- c(ISOdate(year=1, month=1, day=2,
+                       hour=hour(starttime),
+                       min=minute(starttime),
+                       sec=second(starttime)))
+}
+starttime <- starttime_vec[1]
+
+# make event_time and event_faketime vectors and populate
+event_time <- event_df$Time
+event_faketime <- rep(NA, length(event_time))
+for (i in 1:length(event_time)) {
+  if (hour(event_time[i]) > 16 & patient_num != 140095) {
+    event_faketime[i] <- ISOdate(year=1, month=1, day=1,
+                     hour=hour(event_time[i]),
+                     min=minute(event_time[i]),
+                     sec=second(event_time[i]))
+  }
+  else {
+    event_faketime[i] <- ISOdate(year=1, month=1, day=2,
+                     hour=hour(event_time[i]),
+                     min=minute(event_time[i]),
+                     sec=second(event_time[i]))
+  }
+}
+
+# compute event index
+event_index <- event_faketime - starttime
+
+# check that events are placed in correct epochs
+eventepoch_vec <- event_df$Epoch
+correct_eventplacement <- 0
+for (i in 1:length(event_index)) {
+  #print(paste0("Checking event ", i, "."))
+  if (event_index[i] == 0) {
+    if (eventepoch_vec[i] != 1) {
+      print(paste0("Incorrect epoch for event ", i, "."))
+      correct_eventplacement <- 1
+    }
+  }
+  else if (epoch_vec[event_index[i]] != eventepoch_vec[i]) {
+    print(paste0("Incorrect epoch for event ", i, "."))
+    correct_eventplacement <- 1
+  }
+}
+
+# get durations
+event_durations <- as.integer(ceiling(as.numeric(word(event_df$Duration, 1))))
+
+# create binary vector with indicator of event currently happening
+event_happening <- rep(0, length(stage_vec))
+for (i in 1:length(event_index)) {
+  if (event_index[i] != 0) {
+  event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+    rep(1,event_durations[i])
+  }
+  else {
+    event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+    rep(1,(event_durations[i] - 1))
+  }
+}
+# cut off final indices of event_happening if it goes beyond the length of stage_vec
+event_happening <- event_happening[1:length(stage_vec)]
+
+# create counter vector for cumulative number of events
+cum_event_vec <- rep(NA, length(stage_vec))
+curr_count <- 0
+for (i in 1:length(stage_vec)) {
+  if (event_happening[i] == 1) {
+    if (i == 1) {
+      curr_count <- curr_count + 1
+    }
+    else if (event_happening[i-1] == 0) {
+      curr_count <- curr_count + 1
+    }
+  }
+  cum_event_vec[i] <- curr_count
+}
+
+# create updated stage_df
+stage_df <- data.frame(stage_vec, epoch_vec[1:length(stage_vec)], event_happening, cum_event_vec)
+names(stage_df) <- c("stage", "epoch", "event", "cum_events")
+```
+
+```{r}
+# proceed as usual
+
+# Collapse non-REM stages
+stage_df <- stage_df |>
+  mutate(stage = case_when(
+    stage == 11 ~ 11,
+    stage == 12 ~ 12,
+    stage >= 13 ~ 13
+  ))
+
+# update stage_vec
+stage_vec <- stage_df$stage
+
+# At this point, stage_df provides enough to get the necessary info for modeling interevent times
+qR <- 0 # number of seconds spent in REM
+vR <- 0 # number of apnea/hypopnea events in REM
+qN <- 0 # number of seconds spend in non-REM sleep
+vN <- 0 # number of apnea/hypopnea events in non-REM sleep
+
+# loop over the dataframe and increment the above quantities
+for (i in 2:nrow(stage_df)) {
+  if (stage_vec[i] == 12) {
+    qR <- qR + 1
+    if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+      vR <- vR + 1
+    }
+  }
+  else if (stage_vec[i] == 13) {
+    qN <- qN + 1
+    if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+      vN <- vN + 1
+    }
+  }
+}
+
+qR
+vR
+qN
+vN
+
+# collapse stage_df to epoch-level
+stage_epoch_df <- stage_df |>
+  group_by(epoch) |>
+  summarize(stage=mean(stage), event=(n_distinct(event) - 1))
+
+# add a next-stage variable and a cumulative events variable
+stage_epoch_df$next_stage <- c(stage_epoch_df$stage[2:nrow(stage_epoch_df)], NA)
+
+# summarize counts of all combinations of stage, next_stage, and event -- EDITED FOR ONLY 3 STAGES
+stage_transition_counts <- data.frame(rep(12:13, each=6),
+                                      rep(rep(11:13, each=2), 2),
+                                      rep(c(0,1), 6))
+names(stage_transition_counts) <- c("stage", "next_stage", "event")
+
+# count observed transitions
+stage_transition_observed <- stage_epoch_df |>
+  group_by(stage, next_stage, event) |>
+  count() |>
+  filter(!is.na(next_stage) & stage != 11)
+
+# merge counts with all combinations
+stage_transition_counts <- stage_transition_counts |>
+  left_join(stage_transition_observed)
+
+# recode unobserved combinations as zero counts
+for (i in 1:nrow(stage_transition_counts)) {
+  if (is.na(stage_transition_counts$n[i])) {
+    stage_transition_counts$n[i] <- 0
+  }
+}
+
+# create Y matrix for the current patient
+Y_curr <- matrix(rep(NA, 12), ncol=3)
+Y_curr[1,] <- stage_transition_counts$n[c(1,3,5)]
+Y_curr[2,] <- stage_transition_counts$n[c(2,4,6)]
+Y_curr[3,] <- stage_transition_counts$n[c(7,9,11)]
+Y_curr[4,] <- stage_transition_counts$n[c(8,10,12)]
+
+# create X matrix corresponding to the above structure (same for all patients)
+X_curr <- t(matrix(c(1,0,0,0,
+                   1,0,1,0,
+                   0,1,0,0,
+                   0,1,0,1), ncol=4))
+
+# create block of Z matrix for the above structure (same for all patients)
+Z_block_curr <- X_curr
+```
+
+
+```{r}
+get_single_patient_transitions <- function(id_number) {
+  ########### get stage_df and epoch_vec set up correctly ##########
+  
+  # set patient_num
+  patient_num <- id_number
+  
+  # import stage_df
+  stage_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, "STAGE.csv"))
+  names(stage_df) <- c("stage")
+  stage_df <- stage_df |>
+    dplyr::select(stage)
+  
+  # import events df
+  event_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".csv"))
+  names(event_df)<-str_replace_all(names(event_df), c(" " = "." , "," = "" ))
+  
+  # exclude outages from event_df
+  event_df <- event_df |>
+    dplyr::filter(Event.type != "'tech out\",W\"")
+  
+  # Convert sleep stages in event_df to have same format as stage_df
+  event_df <- event_df |>
+    dplyr::mutate(stageval = case_when(
+      Stage == "W" ~ 11,
+      Stage == "R" ~ 12,
+      Stage == "N1" ~ 13,
+      Stage == "N2" ~ 14,
+      Stage == "N3" ~ 15
+    ))
+  
+  # create epoch counter vector -- first epoch 29 seconds
+  epoch_vec <- c(rep(1,29), rep(2:1500, each=30))
+  
+  # pull out stage_vec from stage_df
+  stage_vec <- stage_df$stage
+  
+  # check that the transitions in sleep stages and epochs are lined up
+  stage_vec <- check_and_prepend_alignment(stage_vec)
+  
+  # loop over event stage/epoch pairs and make sure they're aligned
+  eventstage_vec <- as.numeric(event_df$stageval)
+  eventepoch_vec <- as.numeric(event_df$Epoch)
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align != 0) {
+    stage_vec <- 
+      align_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  } 
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align == 0) {
+    print("Epoch and stage alignment successful!")
+  }
+  if (check_align != 0) {
+    print(paste0("Epoch and stage alignment failed for patient ", patient_num, "."))
+    return(1)
+  }
+  
+  
+  # Add values to end of a few patients requiring it
+  if (patient_num %in% c(250145, 440032, 450071, 450098)) {
+    stage_vec <- c(stage_df$stage, 14)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }
+  if (patient_num %in% c(440048)) {
+    stage_vec <- c(stage_df$stage, 13)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }  
+  
+  
+  
+  #### Get apnea events aligned and added
+  
+  # filter event_df for apnea events
+  event_df <- event_df |>
+    filter(Event.type == "Hypopnea" | Event.type == "Obstructive apnea" | Event.type == "Central apnea" | Event.type == "Mixed apnea")
+  
+  # Some patients have times using AM/PM -- convert as needed
+  if (patient_num == 240094) {
+    for (i in 1:nrow(event_df)) {
+      # super messy way to convert am/pm to military time string
+      event_df$Time[i] <- substring(as.character(parse_date_time(event_df$Time[i],
+                                                                 '%I:%M:%S %p')),
+                                    nchar(as.character(parse_date_time(event_df$Time[i],
+                                                                       '%I:%M:%S %p'))) - 8 + 1)
+    }
+    event_df$Time <- hms(event_df$Time)
+  }
+  
+  # import start time from edf file
+  starttime <- readEdfHeader(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".edf"))$startTime
+  
+  # put start_time in same format as other fake times
+  starttime_vec <- c(NA, 1)
+  if (hour(starttime) > 16) {
+    starttime_vec[1] <- ISOdate(year=1, month=1, day=1,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime))
+  }
+  if (hour(starttime) <= 16) {
+    starttime_vec[1] <- c(ISOdate(year=1, month=1, day=2,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime)))
+  }
+  starttime <- starttime_vec[1]
+  
+  # make event_time and event_faketime vectors and populate
+  event_time <- event_df$Time
+  event_faketime <- rep(NA, length(event_time))
+  for (i in 1:length(event_time)) {
+    if (hour(event_time[i]) > 16 & patient_num != 140095) {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=1,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+    else {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=2,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+  }
+  
+  # compute event index
+  event_index <- event_faketime - starttime
+  
+  # check that events are placed in correct epochs
+  eventepoch_vec <- event_df$Epoch
+  for (i in 1:length(event_index)) {
+    #print(paste0("Checking event ", i, "."))
+    if (event_index[i] == 0) {
+      if (eventepoch_vec[i] != 1) {
+        print(paste0("Incorrect epoch for event ", i, "."))
+        return(1)
+      }
+    }
+    else if (epoch_vec[event_index[i]] != eventepoch_vec[i]) {
+      print(paste0("Incorrect epoch for event ", i, "."))
+      return(1)
+    }
+  }
+  
+  # get durations
+  event_durations <- as.integer(ceiling(as.numeric(word(event_df$Duration, 1))))
+  
+  # create binary vector with indicator of event currently happening
+  event_happening <- rep(0, length(stage_vec))
+  for (i in 1:length(event_index)) {
+    if (event_index[i] != 0) {
+    event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,event_durations[i])
+    }
+    else {
+      event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,(event_durations[i] - 1))
+    }
+  }
+  # cut off final indices of event_happening if it goes beyond the length of stage_vec
+  event_happening <- event_happening[1:length(stage_vec)]
+  
+  
+  # create counter vector for cumulative number of events
+  cum_event_vec <- rep(NA, length(stage_vec))
+  curr_count <- 0
+  for (i in 1:length(stage_vec)) {
+    if (event_happening[i] == 1) {
+      if (i == 1) {
+        curr_count <- curr_count + 1
+      }
+      else if (event_happening[i-1] == 0) {
+        curr_count <- curr_count + 1
+      }
+    }
+    cum_event_vec[i] <- curr_count
+  }
+  
+  # create updated stage_df
+  stage_df <- data.frame(stage_vec, epoch_vec[1:length(stage_vec)], event_happening, cum_event_vec)
+  names(stage_df) <- c("stage", "epoch", "event", "cum_events")  
+  
+  
+  
+  # proceed as usual
+  
+  # Collapse non-REM stages
+  stage_df <- stage_df |>
+    mutate(stage = case_when(
+      stage == 11 ~ 11,
+      stage == 12 ~ 12,
+      stage >= 13 ~ 13
+    ))
+  
+  # update stage_vec
+  stage_vec <- stage_df$stage
+  
+  # At this point, stage_df provides enough to get the necessary info for modeling interevent times
+  qR <- 0 # number of seconds spent in REM (excluding time during events except the second of onset)
+  vR <- 0 # number of apnea/hypopnea events in REM
+  qN <- 0 # number of seconds spend in non-REM sleep (excluding time during events except the second of onset)
+  vN <- 0 # number of apnea/hypopnea events in non-REM sleep
+  
+  # loop over the dataframe and increment the above quantities
+  for (i in 2:nrow(stage_df)) {
+    if (stage_vec[i] == 12) {
+      qR <- qR + 1
+      if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+        vR <- vR + 1
+      }
+      else if (event_happening[i] == 1) {
+        qR <- qR - 1
+      }
+    }
+    else if (stage_vec[i] == 13) {
+      qN <- qN + 1
+      if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+        vN <- vN + 1
+      }
+      else if (event_happening[i] == 1) {
+        qN <- qN - 1
+      }
+    }
+  }
+  
+  qR
+  vR
+  qN
+  vN
+  
+  # collapse stage_df to epoch-level
+  stage_epoch_df <- stage_df |>
+    group_by(epoch) |>
+    #summarize(stage=mean(stage), event=(n_distinct(event) - 1))
+    summarize(stage=mean(stage), event=(sum(event) > 0))
+  
+  # add a next-stage variable and a cumulative events variable
+  stage_epoch_df$next_stage <- c(stage_epoch_df$stage[2:nrow(stage_epoch_df)], NA)
+  
+  # summarize counts of all combinations of stage, next_stage, and event -- EDITED FOR ONLY 3 STAGES
+  stage_transition_counts <- data.frame(rep(12:13, each=6),
+                                        rep(rep(11:13, each=2), 2),
+                                        rep(c(0,1), 6))
+  names(stage_transition_counts) <- c("stage", "next_stage", "event")
+  
+  # count observed transitions
+  stage_transition_observed <- stage_epoch_df |>
+    group_by(stage, next_stage, event) |>
+    count() |>
+    filter(!is.na(next_stage) & stage != 11)
+  
+  # merge counts with all combinations
+  stage_transition_counts <- stage_transition_counts |>
+    left_join(stage_transition_observed)
+  
+  # recode unobserved combinations as zero counts
+  for (i in 1:nrow(stage_transition_counts)) {
+    if (is.na(stage_transition_counts$n[i])) {
+      stage_transition_counts$n[i] <- 0
+    }
+  }
+  
+
+  
+  
+  
+  # create Y matrix for the current patient
+  Y_event_curr <- c(qR,vR,qN,vN)
+  
+  Y_curr <- matrix(rep(NA, 12), ncol=3)
+  Y_curr[1,] <- stage_transition_counts$n[c(1,3,5)]
+  Y_curr[2,] <- stage_transition_counts$n[c(2,4,6)]
+  Y_curr[3,] <- stage_transition_counts$n[c(7,9,11)]
+  Y_curr[4,] <- stage_transition_counts$n[c(8,10,12)]
+  
+  # also return longest event
+  longest_duration <- max(event_durations)
+  
+  # return data
+  return(list(Y_curr, Y_event_curr, longest_duration))
+}
+```
+
+```{r}
+# check to see if it's working -- seems right
+get_single_patient_transitions(140014)
+```
+
+
+```{r}
+# loop over multiple patients to get Y, X, and Z
+get_multiple_patient_data <- function(id_numbers) {
+  N <- length(id_numbers)
+  longest_event <- rep(NA, length(id_numbers))
+  
+  # import first patient
+  print(paste0("Importing patient id ", id_numbers[1], "(Patient ", 1, ")"))
+  Y <- get_single_patient_transitions(id_numbers[1])[[1]]
+  Y_event <- get_single_patient_transitions(id_numbers[1])[[2]]
+  longest_event[1] <- get_single_patient_transitions(id_numbers[1])[[3]]
+  
+  # loop over the rest of them
+  for (i in 2:N) {
+    print(paste0("Importing patient id ", id_numbers[i], "(Patient ", i, ")"))
+    curr_data <- get_single_patient_transitions(id_numbers[i])
+    Y <- rbind(Y, curr_data[[1]])
+    Y_event <- rbind(Y_event, curr_data[[2]])
+    longest_event[i] <- curr_data[[3]]
+  }
+  
+  # make X matrix
+  XZ_single <- t(matrix(c(1,0,0,0,
+                     1,0,1,0,
+                     0,1,0,0,
+                     0,1,0,1), ncol=4))
+  
+  X <- kronecker(matrix(rep(1,N), nrow=N), XZ_single)
+  Z <- kronecker(diag(N), XZ_single)
+  
+  # return the results
+  return(list(Y, X, Z, Y_event, longest_event))
+}
+```
+
+
+
+```{r}
+# collect all patient ids
+psg_list <- list.files("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports")
+patient_ids <- c()
+for (i in 1:length(psg_list)) {
+  patient_ids <- c(patient_ids, as.numeric(substr(psg_list[i], 8, 13)))
+}
+
+# filter out duplicates
+patient_ids <- unique(patient_ids)
+
+# filter out patients with inconsistent sleep stage data
+# (i.e., mismatched between the stage and apples-idnumber csv files)
+bad_ids <- c(560210,
+             560226)
+
+
+# filter out ids with no REM sleep
+no_rem_list <- c(140054,
+                 170395,
+                 250132,
+                 250209,
+                 260315,
+                 270379,
+                 340037,
+                 460197,
+                 550159)
+
+patient_ids <- patient_ids[!(patient_ids %in% no_rem_list) & !(patient_ids %in% bad_ids)]
+
+length(bad_ids)
+length(no_rem_list)
+length(patient_ids)
+length(c(bad_ids, no_rem_list, patient_ids))
+```
+
+```{r message=FALSE}
+# Import all patients
+transition_data <- get_multiple_patient_data(patient_ids)
+
+Y <- transition_data[[1]]
+X <- transition_data[[2]]
+Z <- transition_data[[3]]
+Y_event <- transition_data[[4]]
+longest_events <- transition_data[[5]]
+N <- length(patient_ids)
+```
+
+
+```{r}
+# note patient(s) who have zero seconds in either REM or non-REM sleep
+patient_ids[which(Y_event[,1]==0)]
+which(Y_event[,3]==0)
+```
+
+```{r}
+# Shuffling Y to have the reference level always be the current stage
+Y_selfreference <- matrix(data=rep(NA, 4*N*3), nrow=4*N)
+for (i in 1:N) {
+  Y_selfreference[4*(i-1) + 1,] <- Y[4*(i-1) + 1, c(2,1,3)]
+  Y_selfreference[4*(i-1) + 2,] <- Y[4*(i-1) + 2, c(2,1,3)]
+  Y_selfreference[4*(i-1) + 3,] <- Y[4*(i-1) + 3, c(3,1,2)]
+  Y_selfreference[4*(i-1) + 4,] <- Y[4*(i-1) + 4, c(3,1,2)]
+}
+```
+
+```{r}
+# fit the poisson model in stan
+
+# load model
+joint_model_factor <-
+  stan_model("joint_fit_factormodel.stan")
+
+# fit model
+num_patients <- length(patient_ids)
+N <- length(patient_ids)
+k <- 5 # five factors
+options(mc.cores = parallel::detectCores())
+joint_fit_factor <- sampling(joint_model_factor,
+                       list(N=N,
+                            k=k,
+                            Y=Y_selfreference,
+                            X=X,
+                            Z=Z,
+                            Y_seconds=Y_event[,c(1,3)],
+                            Y_eventcounts=Y_event[,c(2,4)]),
+                       iter=5000)
+
+# save model
+saveRDS(joint_fit_factor, "joint_fit_factor_k5_n1093_m2500_chain4.rds")
+```
+
+
+```{r}
+# extract posterior samples and visualize
+post_samples_event <- extract(joint_fit_factor)
+```
+
+
+```{r}
+# ESS and Rhat -- main effects
+
+# lambda_N
+effectiveSize(mcmc(data=matrix(post_samples_event$lambda_N, ncol=1)))
+Rhat(matrix(post_samples_event$lambda_N, ncol=4))
+
+# lambda_R
+effectiveSize(mcmc(data=matrix(post_samples_event$lambda_R, ncol=1)))
+Rhat(matrix(post_samples_event$lambda_R, ncol=4))
+
+# mus and taus
+for (i in 1:4) {
+  for (j in 1:2) {
+    print(effectiveSize(mcmc(data=matrix(post_samples_event$mu_tau[,i,j], ncol=1))))
+    print(Rhat(matrix(post_samples_event$mu_tau[,i,j], ncol=4)))
+  }
+}
+```
+
+```{r}
+# ESS and Rhat -- random effects
+
+# minimum ess and maximum rhat for random effects
+min_ess <- 10000
+max_rhat <- 1
+
+# phi_N and phi_R
+for (i in 1:1093) {
+  ess_phi_N <- effectiveSize(mcmc(matrix(data=post_samples_event$phi_N[,i], ncol=1)))
+  ess_phi_R <- effectiveSize(mcmc(matrix(data=post_samples_event$phi_R[,i], ncol=1)))
+  rhat_phi_N <- Rhat(matrix(data=post_samples_event$phi_N[,i], ncol=4))
+  rhat_phi_R <- Rhat(matrix(data=post_samples_event$phi_R[,i], ncol=4))
+  
+  if (ess_phi_N < min_ess) {
+    min_ess <- ess_phi_N
+  }
+  if (ess_phi_R < min_ess) {
+    min_ess <- ess_phi_R
+  }
+  if (rhat_phi_N > max_rhat) {
+    max_rhat <- rhat_phi_N
+  }
+  if (rhat_phi_R > max_rhat) {
+    max_rhat <- rhat_phi_R
+  }
+}
+
+# alphas and gammas
+for (i in 1:4372) {
+  for (j in 1:2) {
+    curr_ess <- effectiveSize(mcmc(matrix(data=post_samples_event$gamma_alpha[,i,j], ncol=1)))
+    curr_rhat <- Rhat(matrix(data=post_samples_event$gamma_alpha[,i,j], ncol=4))
+    if (curr_ess < min_ess) {
+      min_ess <- curr_ess
+    }
+    if (curr_rhat > max_rhat) {
+      max_rhat <- curr_rhat
+    }
+  }
+}
+
+# print out the min ess and max rhat for the random effects
+min_ess
+max_rhat
+```
+
+```{r}
+# ESS and Rhat -- RE covariance matrix
+min_ess_cov <- 10000
+max_rhat_cov <- 1
+
+# make array for covariance matrix
+cov_mat_array <- array(dim=c(10000,10,10))
+for (i in 1:10000) {
+  cov_mat_array[i,,] <- post_samples_event$Lambda[i,,] %*% t(post_samples_event$Lambda[i,,]) +
+    diag(post_samples_event$Sigma[i,])
+}
+
+# loop over covariance matrix
+for (i in 1:10) {
+  for (j in 1:i) {
+    curr_ess <- effectiveSize(mcmc(matrix(cov_mat_array[,i,j], ncol=1)))
+    curr_rhat <- Rhat(matrix(cov_mat_array[,i,j],ncol=1))
+    if (curr_ess < min_ess_cov) {
+      min_ess_cov <- curr_ess
+    }
+    if (curr_rhat > max_rhat_cov) {
+      max_rhat_cov <- curr_rhat
+    }
+  }
+}
+
+# min ess and max rhat for the random effect covariance matrix
+min_ess_cov
+max_rhat_cov
+```
+
+
+Overall takeaway -- all ESS above 2700 and all Rhat below 1.02 for all main effects, random effects, and random effect covariance terms.
+
+
+# Posterior summaries
+
+```{r}
+# plot some posterior trace plots
+plot(post_samples_event$mu_tau[,1,1], type="l")
+
+plot(post_samples_event$phi_R[,1], type="l")
+
+plot(post_samples_event$Sigma[,1], type="l")
+
+plot(post_samples_event$lambda_N, type="l")
+
+plot(post_samples_event$lambda_R, type="l")
+
+plot(post_samples_event$gamma_alpha[,2,2], type="l")
+```
+
+
+```{r}
+# visualize covariance and correlation matrices
+post_samples_event$Lambda[1,,] %*% t(post_samples_event$Lambda[1,,])
+diag(post_samples_event$Sigma[1,])
+
+# posterior mean of RE covariance matrix
+cov_mat <- matrix(data=rep(0,100), nrow=10, ncol=10)
+for (i in 1:10000) {
+  cov_mat <- cov_mat + post_samples_event$Lambda[i,,] %*% t(post_samples_event$Lambda[i,,]) + diag(post_samples_event$Sigma[i,])
+}
+cov_mat <- cov_mat / 10000
+cov_mat
+
+corr_mat <- cov2cor(cov_mat)
+corr_mat
+```
+
+```{r}
+# add names to correlation matrix for plotting
+colnames(corr_mat) <- c("gamma_RA",
+                       "gamma_NA",
+                       "alpha_RA",
+                       "alpha_NA",
+                       "gamma_RN",
+                       "gamma_NR",
+                       "alpha_RN",
+                       "alpha_NR",
+                       "phi_R",
+                       "phi_N")
+rownames(corr_mat) <- colnames(corr_mat)
+corr_mat
+
+# reorder the columns and rows for plotting
+corr_mat <- corr_mat[c(1,3,5,7,6,8,2,4,9,10), c(1,3,5,7,6,8,2,4,9,10)]
+corr_mat
+```
+
+```{r}
+# plot the correlation matrix -- SELF: should white out any where the 95% CI includes zero
+ggcorrplot(corr_mat,
+           colors = c("blue", "white", "darkorange2"))
+```
+
+```{r}
+# form array of covariance samples
+cov_mat_samples <- array(dim=c(10,10,10000))
+for (i in 1:10000) {
+  cov_mat_samples[,,i] <- post_samples_event$Lambda[i,,] %*% t(post_samples_event$Lambda[i,,]) + diag(post_samples_event$Sigma[i,])
+}
+
+
+# mixing of covariance matrix
+for (i in 1:10) {
+  for (j in 1:i) {
+    plot(cov_mat_samples[i,j,], type="l", main=paste0("Cov_",i,j))
+  }
+}
+```
+
+
+
+```{r}
+### experimenting with the match align algorithm to visualize factors
+
+# fast implementation for a list of samples
+k0 = 5
+p = 20
+n = 100
+lambda = matrix(rnorm(p*k0, 0, 0.01), ncol = k0)
+lambda[sample.int(p, 40, replace = TRUE) +
+p*(sample.int(k0, 40, replace = TRUE)-1)] = rnorm(40, 0, 1)
+lambda[1:7, 1] = rnorm(7, 2, 0.5)
+lambda[8:14, 2] = rnorm(7, -2, 0.5)
+lambda[15:20, 3] = rnorm(6, 2, 0.5)
+lambda[,4] = rnorm(p, 0, 0.5)
+lambda[,5] = rnorm(p, 0, 0.5)
+plotmat(varimax(lambda)[[1]])
+X = matrix(rnorm(n*k0),n,k0)%*%t(lambda) + matrix(rnorm(n*p), n, p)
+out = linearMGSP(X = X, nrun = 1000, burn = 500, adapt = FALSE)
+vari = lapply(out$lambdaSamps, varimax)
+loads = lapply(vari, `[[`, 1)
+norms = sapply(loads, norm, "2")
+pivot = loads[order(norms)][[250]]
+aligned = lapply(loads, msf, pivot)
+plotmat(summat(aligned))
+
+# simpler example
+lambda = diag(10)[,sample(10)] + 0.001
+pivot = diag(10)
+msf(lambda, pivot)
+```
+
+
+
+```{r}
+# visualize the factors after rotation
+
+# convert samples of Lambda to a list
+LambdaSamps <- lapply(seq(dim(post_samples_event$Lambda)[1]), function(x) post_samples_event$Lambda[x ,c(1,3,5,7,6,8,2,4,9,10), ])
+
+# run the match align algorithm
+vari = lapply(LambdaSamps, varimax)
+loads = lapply(vari, `[[`, 1)
+norms = sapply(loads, norm, "2")
+pivot = loads[order(norms)][[1000]]
+aligned = lapply(loads, msf, pivot)
+aligned_mat <- summat(aligned)
+
+# make df for plotting
+factor <- rep(c("1","2","3", "4", "5"), each=10)
+loading <- c(aligned_mat[,1], aligned_mat[,2], aligned_mat[,3], aligned_mat[,4], aligned_mat[,5])
+random_effect <- rep(c("gamma_RA",
+                       "alpha_RA",
+                       "gamma_RN",
+                       "alpha_RN",
+                       "gamma_NR",
+                       "alpha_NR",
+                       "gamma_NA",
+                       "alpha_NA",
+                       "phi_R",
+                       "phi_N"), 5)
+plot_df <- data.frame(factor, loading, random_effect)
+plot_df$random_effect <- factor(plot_df$random_effect, levels = c("gamma_RA",
+                       "alpha_RA",
+                       "gamma_RN",
+                       "alpha_RN",
+                       "gamma_NR",
+                       "alpha_NR",
+                       "gamma_NA",
+                       "alpha_NA",
+                       "phi_R",
+                       "phi_N"))
+ggplot(plot_df, aes(x=factor, y=random_effect, fill=loading)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue",
+                       mid = "white",
+                       high = "darkorange") +
+  labs(title="Aligned factor loadings for random effects",
+       subtitle="Loadings for which the 95% credible interval contains zero are set to zero",
+       y="")
+
+  
+```
+
+```{r}
+# check mixing of the aligned factors
+Lambda_11 <- rep(NA, 10000)
+for (i in 1:10000) {
+  Lambda_11[i] <- aligned[[i]][10,1]
+}
+plot(Lambda_11, type="l")
+```
+
+
+```{r}
+# make vectors with the means and upper/lower 95% credible bounds for the rate parameters
+rate_means <- c(mean(post_samples_event$lambda_R), mean(post_samples_event$lambda_N))
+rate_lower <- c(quantile(post_samples_event$lambda_R, probs=c(0.025)), 
+                quantile(post_samples_event$lambda_N, probs=c(0.025)))
+rate_upper <- c(quantile(post_samples_event$lambda_R, probs=c(0.975)), 
+                quantile(post_samples_event$lambda_N, probs=c(0.975)))
+rate_names <- c("lambda_R", "lambda_N")
+
+
+rate_main_df <- data.frame(rate_means, rate_lower, rate_upper, rate_names)
+names(rate_main_df) <- c("posterior_mean", "lower", "upper", "parameter")
+
+
+ggplot(data=rate_main_df, aes(x=parameter, y=posterior_mean)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper)) +
+  ylim(0, 0.025) +
+  geom_point(color="red") +
+  coord_flip() +
+  labs(title="Inter-event time model fixed effects",
+       x="", y="")
+
+```
+
+
+
+```{r}
+# make vectors with the means and upper/lower 95% credible bounds for the rate parameters
+rate_means <- c(mean(cov_mat_samples[9,9,]), mean(cov_mat_samples[10,10,]))
+rate_lower <- c(quantile(cov_mat_samples[9,9,], probs=c(0.025)), 
+                quantile(cov_mat_samples[10,10,], probs=c(0.025)))
+rate_upper <- c(quantile(cov_mat_samples[9,9,], probs=c(0.975)), 
+                quantile(cov_mat_samples[10,10,], probs=c(0.975)))
+rate_names <- c("var(phi_R)", "var(phi_N)")
+
+
+rate_re_var_df <- data.frame(rate_means, rate_lower, rate_upper, rate_names)
+names(rate_re_var_df) <- c("posterior_mean", "lower", "upper", "parameter")
+
+
+ggplot(data=rate_re_var_df, aes(x=parameter, y=posterior_mean)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper)) +
+  ylim(0, 0.9) +
+  geom_point(color="red") +
+  coord_flip() +
+  labs(title="Inter-event time model random effect variances",
+       x="", y="")
+
+```
+
+```{r}
+# visualize main effects
+# NOTE: Here and elsewhere, the _R parameters become NA and RA (always waking up),
+# and the _N parameters become NR and RN (always switching to the opposite sleep stage)
+maineffect_means <- apply(post_samples_event$mu_tau, c(2,3), mean)
+maineffect_lower <- apply(post_samples_event$mu_tau, c(2,3), quantile, probs=0.025)
+maineffect_upper <- apply(post_samples_event$mu_tau, c(2,3), quantile, probs=0.975)
+maineffect_names <- t(matrix(c("mu_RA", "mu_RN",
+                             "mu_NA", "mu_NR",
+                             "tau_RA", "tau_RN",
+                             "tau_NA", "tau_NR"),
+                           nrow=2, ncol=4))
+
+maineffect_means
+maineffect_lower
+maineffect_upper
+maineffect_names
+
+maineffect_df <- data.frame(as.vector(maineffect_names),
+                            as.vector(maineffect_means),
+                            as.vector(maineffect_lower),
+                            as.vector(maineffect_upper))
+names(maineffect_df) <- c("parameter", "posterior_mean", "lower", "upper")
+
+# reorder names for plotting
+maineffect_df$parameter <- factor(maineffect_df$parameter, levels=c("tau_RN", "tau_RA",
+                                                                    "tau_NR", "tau_NA",
+                                                                    "mu_RN", "mu_RA",
+                                                                    "mu_NR", "mu_NA"))
+
+
+ggplot(data=maineffect_df, aes(x=parameter, y=posterior_mean)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper)) +
+  geom_hline(yintercept = 0, color="black") +
+  geom_point(color="red") +
+  coord_flip() +
+  labs(title="Markov transition model fixed effects",
+       subtitle="mus are transition effects; taus are shifts by apnea event",
+       x="", y="")
+
+```
+
+
+```{r}
+# make vectors with the means and upper/lower 95% credible bounds for the rate parameters
+var_order <- c(1,3,5,7,6,8,2,4,9,10)
+#var_order <- 1:10
+
+rate_means <- rep(NA, 8)
+rate_lower <- rep(NA, 8)
+rate_upper <- rep(NA, 8)
+for (i in 1:8) {
+  rate_means[i] <- mean(cov_mat_samples[var_order[i],var_order[i],])
+  rate_lower[i] <- quantile(cov_mat_samples[var_order[i],var_order[i],], probs=c(0.025))
+  rate_upper[i] <- quantile(cov_mat_samples[var_order[i],var_order[i],], probs=c(0.975))
+}
+rate_names <- colnames(corr_mat)[1:8]
+
+
+rate_re_var_df <- data.frame(rate_means, rate_lower, rate_upper, rate_names)
+names(rate_re_var_df) <- c("posterior_mean", "lower", "upper", "parameter")
+
+rate_re_var_df$parameter <- factor(rate_re_var_df$parameter, levels=c("alpha_RN", "alpha_RA",
+                                                                    "alpha_NR", "alpha_NA",
+                                                                    "gamma_RN", "gamma_RA",
+                                                                    "gamma_NR", "gamma_NA"))
+
+# add var() for matching the event plot
+rate_re_var_df <- rate_re_var_df |>
+  mutate(parameter_label = case_when(
+    parameter == "alpha_RN" ~ "var(alpha_RN)",
+    parameter == "alpha_RA" ~ "var(alpha_RA)",
+    parameter == "alpha_NR" ~ "var(alpha_NR)",
+    parameter == "alpha_NA" ~ "var(alpha_NA)",
+    parameter == "gamma_RN" ~ "var(gamma_RN)",
+    parameter == "gamma_RA" ~ "var(gamma_RA)",
+    parameter == "gamma_NR" ~ "var(gamma_NR)",
+    parameter == "gamma_NA" ~ "var(gamma_NA)"
+  ))
+
+rate_re_var_df$parameter_label <- factor(rate_re_var_df$parameter_label, levels=c("var(alpha_RN)", "var(alpha_RA)",
+                                                                    "var(alpha_NR)", "var(alpha_NA)",
+                                                                    "var(gamma_RN)", "var(gamma_RA)",
+                                                                    "var(gamma_NR)", "var(gamma_NA)"))
+
+ggplot(data=rate_re_var_df, aes(x=parameter_label, y=posterior_mean)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper)) +
+  ylim(0, 1) +
+  geom_point(color="red") +
+  coord_flip() +
+  labs(title="Markov transition model random effect variances",
+       subtitle="gammas are transition effects; alphas are shifts by apnea event",
+       x="", y="")
+
+```
+
+
+## Clustering
+
+```{r}
+# load posterior samples to use for clustering
+joint_fit_factor <- readRDS("joint_fit_factor_k5_n1093_m2500_chain4.rds")
+
+# extract posterior samples and visualize
+post_samples_event <- extract(joint_fit_factor)
+```
+
+
+```{r}
+# organize posterior samples of theta
+m <- 10000
+N <- 1093
+theta_samples <- array(dim=c(10,N,m))
+for (l in 1:m) {
+  for (i in 1:N) {
+    theta_samples[1:8,i,l] <- as.vector(post_samples_event$gamma_alpha[l,((i-1)*4 + 1):(i*4),1:2])
+    theta_samples[9,i,l] <- post_samples_event$phi_R[l,i]
+    theta_samples[10,i,l] <- post_samples_event$phi_N[l,i]
+  }
+}
+```
+
+```{r}
+# compute posterior means of thetas
+theta_postmean <- apply(theta_samples, c(2,1), mean)
+```
+
+```{r}
+# compute theta_tilde
+theta_tilde <- matrix(nrow=N, ncol=m*d)
+for (i in 1:N) {
+  for (j in 1:m) {
+    for (l in 1:d) {
+      theta_tilde[i, (j-1)*d + l] <- theta_samples[l,i,j]
+    }
+  }
+}
+```
+
+
+```{r}
+# helper functions for clustering gibbs sampler
+
+##### compute sum of squares loss for a given matrix of observations (N rows, d columns)
+SSE <- function(obs_mat) {
+  obs_mat_colMeans <- colMeans(obs_mat)
+  #return(sum(t(t(obs_mat) - obs_mat_colMeans)^2) / m)
+  return(sum(t(t(obs_mat) - obs_mat_colMeans)^2))
+}
+
+#### compute term proportional to Pr(c_i = k) for a given pair of loss values and a lambda value
+rho_ratio <- function(loss_num, loss_denom, lambda) {
+  return(exp(-1 * lambda * loss_num + lambda * loss_denom))
+}
+
+log_rho_ratio <- function(loss_num, loss_denom, lambda) {
+  return(-1 * lambda * loss_num + lambda * loss_denom)
+}
+
+#### compute vector of Pr(c_i = k) for a given list of log rho ratios
+get_prob_vec <- function(rho_ratio_vec) {
+  prob_vec <- rep(NA, length(rho_ratio_vec))
+  for (i in 1:length(prob_vec)) {
+    prob_vec[i] <- rho_ratio_vec[i] / sum(rho_ratio_vec)
+  }
+  return(prob_vec)
+}
+
+get_prob_vec_from_log <- function(log_rho_ratio_vec) {
+  prob_vec <- rep(NA, length(log_rho_ratio_vec))
+  for (i in 1:length(prob_vec)) {
+    prob_vec[i] <- 1 / (1 + sum(exp(log_rho_ratio_vec[-i] - log_rho_ratio_vec[i])))
+  }
+  return(prob_vec)
+}
+
+#### generate sample of cluster label given a vector of probabilities
+get_c_i <- function(prob_vec) {
+  return(sample(x=1:length(prob_vec), 1, prob=prob_vec))
+}
+
+#### generate sample of lambda given a_lambda, b_lambda, N, d, and a vector of squared errors
+get_lambda <- function(N, d, a_lambda, b_lambda, total_WSSE) {
+  curr_shape <- a_lambda + N*d/2
+  curr_rate <- b_lambda + total_WSSE
+  curr_sample <- rgamma(n=1, shape=curr_shape, rate=curr_rate)
+  return(curr_sample)
+}
+
+#### generate sample of lambda given k, a current theta vector, and a current set of cluster labels
+sample_lambda <- function(N, d, a_lambda, b_lambda, k, theta_mat, label_vec) {
+  # get total WSSE
+  WSSE_vec <- rep(NA, k)
+  for (i in 1:k) {
+    #print(theta_mat[which(label_vec==i),])
+    WSSE_vec[i] <- SSE(theta_mat[which(label_vec==i),])
+    #print(WSSE_vec)
+  }
+  total_WSSE <- sum(WSSE_vec)
+  
+  # draw sample and return
+  curr_sample <- get_lambda(N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda, total_WSSE=total_WSSE)
+  return(curr_sample)
+}
+
+#### generate sample of c_i given k, lambda, theta_minus_i, theta_i, label_minus_i
+sample_c_i <- function(k, lambda, theta_minus_i, theta_i, label_minus_i) {
+  rho_ratio_vec <- rep(NA, k)
+  for (i in 1:k) {
+    loss_num <- SSE(rbind(theta_minus_i[which(label_minus_i == i),], theta_i))
+    #print(loss_num)
+    #print(loss_num)
+    #SSE(theta_minus_i[which(label_minus_i==i),])
+    loss_denom <- SSE(theta_minus_i[which(label_minus_i==i),])
+    #print(loss_denom)
+    #print(loss_denom)
+    rho_ratio_vec[i] <- rho_ratio(loss_num=loss_num, loss_denom=loss_denom, lambda=lambda)
+  }
+  #print(rho_ratio_vec)
+  
+  prob_vec <- get_prob_vec(rho_ratio_vec)
+  #print(prob_vec)
+  
+  curr_sample <- get_c_i(prob_vec)
+  
+  return(curr_sample)
+}
+
+sample_c_i_with_log <- function(k, lambda, theta_minus_i, theta_i, label_minus_i) {
+  log_rho_ratio_vec <- rep(NA, k)
+  for (i in 1:k) {
+    loss_num <- SSE(rbind(theta_minus_i[which(label_minus_i == i),], theta_i))
+    #print(loss_num)
+    #print(loss_num)
+    #SSE(theta_minus_i[which(label_minus_i==i),])
+    loss_denom <- SSE(theta_minus_i[which(label_minus_i==i),])
+    #print(loss_denom)
+    #print(loss_denom)
+    log_rho_ratio_vec[i] <- log_rho_ratio(loss_num=loss_num, loss_denom=loss_denom, lambda=lambda)
+  }
+  #print(log_rho_ratio_vec)
+  
+  prob_vec <- get_prob_vec_from_log(log_rho_ratio_vec)
+  #print(prob_vec)
+  
+  curr_sample <- get_c_i(prob_vec)
+  
+  return(curr_sample)
+}
+```
+
+```{r}
+#### set hyperparameter values
+k <- 4
+N <- 1093
+m <- 10000
+d <- 10
+a_lambda <- 1
+b_lambda <- 1
+```
+
+
+```{r}
+##### get initial cluster labels (Bayes optimal)
+
+# run k-means using posterior means
+km.out.bayes4 <- kmeans(theta_postmean, centers=k, nstart=50)
+label_init <- km.out.bayes4$cluster
+label_init
+km.out.bayes4$size
+```
+
+
+```{r}
+##### function to run one iteration of sampler given previous values of lambda and the clustering
+gibbs_iteration <- function(k, N, d, a_lambda, b_lambda,
+                            label_prev, theta_mat) {
+  
+  ## draw new lambda value
+  lambda_new <- sample_lambda(N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda, k=k,
+                              theta_mat=theta_mat, label_vec=label_prev)
+  
+  ## loop over patients, drawing new label_vec
+  label_new <- label_prev
+  for (i in 1:N) {
+    theta_i <- theta_mat[i,]
+    theta_minus_i <- theta_mat[-i,]
+    label_minus_i <- label_new[-i]
+    label_new[i] <- sample_c_i_with_log(k=k, lambda=lambda_new, theta_minus_i=theta_minus_i, theta_i=theta_i, label_minus_i=label_minus_i)
+    #label_new[i] <- sample_c_i(k=k, lambda=lambda_new, theta_minus_i=theta_minus_i, theta_i=theta_i, label_minus_i=label_minus_i)
+  }
+  
+  return(list(lambda_new, label_new))
+}
+```
+
+
+```{r}
+############### run full sampler -- posterior means of theta #################
+
+# set number of clustering samples
+cluster_sample_num <- 10000
+
+# set initial lambda
+lambda_init <- 1
+
+# initialize data storage
+C_post_mat <- matrix(nrow=cluster_sample_num, ncol=N)
+lambda_post_vec <- rep(NA, cluster_sample_num)
+
+# populate initial values
+C_post_mat[1,] <- label_init
+lambda_post_vec[1] <- lambda_init
+
+for (i in 2:cluster_sample_num) {
+  new_sample <- gibbs_iteration(k=k, N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda,
+                                label_prev=C_post_mat[(i-1),], theta_mat=theta_postmean)
+  
+  C_post_mat[i,] <- new_sample[[2]]
+  lambda_post_vec[i] <- new_sample[[1]]
+}
+```
+
+
+```{r}
+# visualize pairwise probabilities of co-clusters
+co_prob_mat <- matrix(nrow=N, ncol=N)
+for (i in 1:N) {
+  for (j in 1:N) {
+    co_prob_mat[i,j] <- sum(C_post_mat[,i] == C_post_mat[,j]) / cluster_sample_num
+  }
+}
+```
+
+```{r}
+heatmap(co_prob_mat[c(which(label_init==1), which(label_init==2), which(label_init==3), which(label_init==4)),
+                    c(which(label_init==1), which(label_init==2), which(label_init==3), which(label_init==4))],
+        Colv=NA, Rowv=NA, scale="none",
+        main="Co-clustering probabilities ordered by cluster label")
+```
+
+TODO -- plot 2D projection four different times, with color as the probability of being in cluster 1, 2, 3, and 4
+
+```{r}
+# plot patient posterior means of different pairs of REs
+plot_df <- data.frame(theta_postmean[,c(1,3,5,7,6,8,2,4,9,10)])
+names(plot_df) <- c("gamma_RA",
+                       "alpha_RA",
+                       "gamma_RN",
+                       "alpha_RN",
+                       "gamma_NR",
+                       "alpha_NR",
+                       "gamma_NA",
+                       "alpha_NA",
+                       "phi_R",
+                       "phi_N")
+plot_df$cluster <- as.factor(label_init)
+
+plot_df <- plot_df |>
+  mutate(sum_phi = phi_R + phi_N) |>
+  mutate(sum_alpha_gamma = gamma_RA + alpha_RA + gamma_RN + alpha_RN +
+           gamma_NA + alpha_NA + gamma_NR + alpha_NR)
+
+ggplot(plot_df, aes(x=sum_alpha_gamma, y=sum_phi, color=cluster)) +
+  geom_point()
+```
+
+```{r}
+# try projecting onto first two PCs
+
+RE_matrix <- as.matrix(plot_df[,1:10])
+
+pca_RE <- prcomp(RE_matrix, scale. = T)
+
+summary(pca_RE)
+
+pca_RE$rotation
+
+plot_df$pc1 <- pca_RE$x[,1]
+plot_df$pc2 <- pca_RE$x[,2]
+plot_df$pc3 <- pca_RE$x[,3]
+
+#pca_RE$x[,1]
+```
+```{r}
+# plot clusters on scatterplot of principal components
+ggplot(plot_df, aes(x=pc1, y=pc2, color=cluster)) +
+  geom_point() +
+  labs(title="Bayes-optimal clustering")
+```
+
+```{r}
+# try pca for only the dynamics variables
+pca_RE_dynamics <- prcomp(RE_matrix[,(1:8)], scale. = T)
+
+
+summary(pca_RE_dynamics)
+
+# flip sign for inerpretability
+pca_RE_dynamics$rotation[,1] <- pca_RE$rotation[,1] * -1
+pca_RE_dynamics$x[,1] <- pca_RE$x[,1] * -1
+
+pca_RE_dynamics$rotation
+
+plot_df$pc1 <- pca_RE_dynamics$x[,1]
+plot_df$pc2 <- pca_RE_dynamics$x[,2]
+plot_df$pc3 <- pca_RE_dynamics$x[,3]
+```
+
+
+```{r}
+# compute closest points to each of the cluster centers
+
+get_closest_point_index <- function(cluster, theta_mat, label_vec) {
+  theta_curr <- theta_mat[which(label_vec==cluster),]
+  center_curr <- colMeans(theta_curr)
+  curr_best_dist <- sum((theta_mat[1,] - center_curr)^2)
+  curr_best_index <- 1
+  for (i in 2:nrow(theta_mat)) {
+    curr_dist <- sum((theta_mat[i,] - center_curr)^2)
+    if (curr_dist < curr_best_dist) {
+      curr_best_dist <- curr_dist
+      curr_best_index <- i
+    }
+  }
+  return(curr_best_index)
+}
+
+# get indices of points closest to each cluster center
+c1_index <- get_closest_point_index(1, theta_postmean, label_init)
+c2_index <- get_closest_point_index(2, theta_postmean, label_init)
+c3_index <- get_closest_point_index(3, theta_postmean, label_init)
+c4_index <- get_closest_point_index(4, theta_postmean, label_init)
+
+c1_index
+c2_index
+c3_index
+c4_index
+```
+```{r}
+# verify that these points are always in the designated cluster (almost)
+plot(C_post_mat[,c1_index], type="l")
+plot(C_post_mat[,c2_index], type="l")
+plot(C_post_mat[,c3_index], type="l")
+plot(C_post_mat[,c4_index], type="l")
+```
+
+
+```{r}
+# make plot with probability of being in each cluster
+plot_df$prob_c1 <- co_prob_mat[c1_index,]
+plot_df$prob_c2 <- co_prob_mat[c2_index,]
+plot_df$prob_c3 <- co_prob_mat[c3_index,]
+plot_df$prob_c4 <- co_prob_mat[c4_index,]
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c1)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Gibbs posterior")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c2)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Gibbs posterior")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c3)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 3 -- Gibbs posterior")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c4)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Gibbs posterior")
+```
+
+```{r}
+# compute type (1) UQ -- probability that an individual's theta_i is closest to center c_k
+c1_probs <- rep(0, 1093)
+c2_probs <- rep(0, 1093)
+c3_probs <- rep(0, 1093)
+c4_probs <- rep(0, 1093)
+
+# centers
+c1 <- km.out.bayes4$centers[1,]
+c2 <- km.out.bayes4$centers[2,]
+c3 <- km.out.bayes4$centers[3,]
+c4 <- km.out.bayes4$centers[4,]
+
+
+for (i in 1:N) {
+  for (j in 1:m) {
+    theta_curr <- theta_samples[,i,j]
+    d1_curr <- sum((theta_curr - c1)^2)
+    d2_curr <- sum((theta_curr - c2)^2)
+    d3_curr <- sum((theta_curr - c3)^2)
+    d4_curr <- sum((theta_curr - c4)^2)
+    min_dist_index <- which.min(c(d1_curr,d2_curr,d3_curr,d4_curr))
+    if (min_dist_index == 1) {
+      c1_probs[i] <- c1_probs[i] + 1 / m
+    }
+    else if (min_dist_index == 2) {
+      c2_probs[i] <- c2_probs[i] + 1 / m
+    }
+    else if (min_dist_index == 3) {
+      c3_probs[i] <- c3_probs[i] + 1 / m
+    }
+    else if (min_dist_index == 4) {
+      c4_probs[i] <- c4_probs[i] + 1 / m
+    }
+  }
+}
+```
+
+```{r}
+# make plot with probability of being in each cluster
+plot_df$prob_c1 <- c1_probs
+plot_df$prob_c2 <- c2_probs
+plot_df$prob_c3 <- c3_probs
+plot_df$prob_c4 <- c4_probs
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c1)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Type (1)")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c2)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Type (1)")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c3)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 3 -- Type (1)")
+
+ggplot(plot_df, aes(x=pc1, y=pc2, color=prob_c4)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Type (1)")
+```
+
+
+
+
