@@ -32,20 +32,13 @@ names(df_figures)[9:10] <- c("phi_R", "phi_N")
 
 ```{r}
 # clustering point estimate
-df_figures$cluster <- plot_df$cluster
+df_figures$cluster <- as.factor(label_init)
 
 # type 1 assignment probabilities
 df_figures$type1_cluster1prob <- c1_probs
 df_figures$type1_cluster2prob <- c2_probs
 df_figures$type1_cluster3prob <- c3_probs
 df_figures$type1_cluster4prob <- c4_probs
-
-# type 2 assignment probabilities
-# (Gibbs posterior probability of co-clustering with the point closest to the center of each cluster)
-df_figures$type2_cluster1prob <- co_prob_mat[c1_index,]
-df_figures$type2_cluster2prob <- co_prob_mat[c2_index,]
-df_figures$type2_cluster3prob <- co_prob_mat[c3_index,]
-df_figures$type2_cluster4prob <- co_prob_mat[c4_index,]
 ```
 
 
@@ -333,10 +326,12 @@ get_single_patient_EDA_variables <- function(id_number) {
   length_median_N <- median(event_length_vec_N)
   
   # collapse stage_df to epoch-level
+  print("made to till group-by/summarize")
   stage_epoch_df <- stage_df |>
     group_by(epoch) |>
     #summarize(stage=mean(stage), event=(n_distinct(event) - 1))
-    summarize(stage=mean(stage), event=(sum(event) > 0))
+    dplyr::summarize(stage=mean(stage), event=(sum(event) > 0))
+  print("completed group-by/summarize")
   
   # add a next-stage variable and a cumulative events variable
   stage_epoch_df$next_stage <- c(stage_epoch_df$stage[2:nrow(stage_epoch_df)], NA)
@@ -514,7 +509,7 @@ test_df <- read_csv("/Users/glennpalmer/Desktop/sleep_research_2024/apples/origi
 test_df <- test_df |>
   dplyr::filter(Visit=="DX")
 
-# sleepiness covariate from baseline df
+# organizing test scores by patient ID
 PFNTOTL <- rep(NA, nrow(df_figures))
 BSRT_SumRecall <- rep(NA, nrow(df_figures))
 for (i in 1:nrow(df_figures)) {
@@ -527,8 +522,17 @@ for (i in 1:nrow(df_figures)) {
 df_figures$PFNTOTL <- PFNTOTL
 df_figures$BSRT_SumRecall <- BSRT_SumRecall
 ```
+
 ```{r}
 # add first pc scores (dynamics only)
+pca_RE_dynamics <- prcomp(theta_postmean[,(1:8)], scale. = T)
+
+
+summary(pca_RE_dynamics)
+
+# flip sign for inerpretability
+pca_RE_dynamics$rotation[,1] <- pca_RE_dynamics$rotation[,1] * -1
+pca_RE_dynamics$x[,1] <- pca_RE_dynamics$x[,1] * -1
 
 # print pc vectors
 pca_RE_dynamics$rotation
@@ -539,7 +543,7 @@ df_figures$pc1_dynamics <- pca_RE_dynamics$x[,1]
 
 
 
-############# Make plots!! ###############
+############# Make plots ###############
 
 # EDA boxplots
 
@@ -583,7 +587,7 @@ ggplot(data=rbind(df_figures, df_figures, df_figures),
 
 
 
-# Principal components to choose k
+# Principal components variance explained
 
 ```{r}
 theta_pca <- princomp(df_figures[,1:10])
@@ -637,150 +641,12 @@ ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster4prob)) +
   scale_color_continuous(type="viridis", limits=c(0,1)) +
   theme(legend.title=element_blank())
 ```
-```{r}
-# assignment probability plots -- Type 2
-ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster1prob)) +
-  geom_point() +
-  labs(title="Probability of being in cluster 1 -- Type 2 uncertainty",
-       x="pc1") +
-  scale_color_continuous(type="viridis", limits=c(0,1)) +
-  theme(legend.title=element_blank())
-
-ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster2prob)) +
-  geom_point() +
-  labs(title="Probability of being in cluster 2 -- Type 2 uncertainty",
-       x="pc1") +
-  scale_color_continuous(type="viridis", limits=c(0,1)) +
-  theme(legend.title=element_blank())
-
-ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster3prob)) +
-  geom_point() +
-  labs(title="Probability of being in cluster 3 -- Type 2 uncertainty",
-       x="pc1") +
-  scale_color_continuous(type="viridis", limits=c(0,1)) +
-  theme(legend.title=element_blank())
-
-ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster4prob)) +
-  geom_point() +
-  labs(title="Probability of being in cluster 4 -- Type 2 uncertainty",
-       x="pc1") +
-  scale_color_continuous(type="viridis", limits=c(0,1)) +
-  theme(legend.title=element_blank())
-```
 
 
-# Clustering UQ comparison
+# Other variables by cluster (unweighted and weighted)
 
 ```{r}
-# add a variable for the probabilities of being assigned to the cluster point estimate
-df_figures <- df_figures |>
-  mutate(prob_assigned_type1 = case_when(
-    cluster == "1" ~ type1_cluster1prob,
-    cluster == "2" ~ type1_cluster2prob,
-    cluster == "3" ~ type1_cluster3prob,
-    cluster == "4" ~ type1_cluster4prob
-  )) |>
-  mutate(prob_assigned_type2 = case_when(
-    cluster == "1" ~ type2_cluster1prob,
-    cluster == "2" ~ type2_cluster2prob,
-    cluster == "3" ~ type2_cluster3prob,
-    cluster == "4" ~ type2_cluster4prob
-  ))
-```
-
-```{r}
-# make dataframe for plotting
-sorted_type1_prob <- df_figures$prob_assigned_type1[order(df_figures$prob_assigned_type2)]
-sorted_type2_prob <- df_figures$prob_assigned_type2[order(df_figures$prob_assigned_type2)]
-df_compare_uq <- data.frame(1:nrow(df_figures),
-                            rep(c("Type 1", "Type 2"), each=nrow(df_figures)),
-                            c(sorted_type1_prob, sorted_type2_prob))
-names(df_compare_uq) <- c("Patient", "UQ_Type", "Prob_Assigned")
-
-# make plot
-ggplot(df_compare_uq, aes(x=Patient, y=Prob_Assigned, color=UQ_Type)) +
-  geom_point() +
-  labs(title="Cluster assignment probabilities -- Type 1 vs. 2 uncertainty",
-       x="Patient index (sorted by increasing Type 2 assignment probability)",
-       y="Probability of assigned cluster")
-
-# scatter plot instead
-ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=total_sleep)) +
-  geom_abline(slope = 1,
-              intercept = 0,
-              color="red",
-              size=1) +
-  geom_point() +
-  xlim(0,1) +
-  ylim(0,1) +
-  scale_color_continuous(type="viridis")
-
-
-ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=time_in_REM)) +
-  geom_abline(slope = 1,
-              intercept = 0,
-              color="red",
-              size=1) +
-  geom_point() +
-  xlim(0,1) +
-  ylim(0,1) +
-  scale_color_continuous(type="viridis")
-
-ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=cluster)) +
-  geom_abline(slope = 1,
-              intercept = 0,
-              color="black",
-              size=1) +
-  geom_point() +
-  xlim(0,1) +
-  ylim(0,1) +
-  labs(title="Probability of assignment to cluster point estimate",
-       x="Type 1 assignment probability",
-       y="Type 2 assignment probability")
-
-```
-
-
-# Other variables by cluster (weighted and unweighted)
-
-```{r}
-# summarize cluster centers
-
-# cluster 1
-colMeans((df_figures |> filter(cluster=="1"))[,1:10])
-
-# cluster 2
-colMeans((df_figures |> filter(cluster=="2"))[,1:10])
-
-# cluster 3
-colMeans((df_figures |> filter(cluster=="3"))[,1:10])
-
-# cluster 4
-colMeans((df_figures |> filter(cluster=="4"))[,1:10])
-
-```
-
-```{r}
-# summarize other variables -- note: this is doing something funky (removing rows based on missingness for a single column?)
-# (the AHI values change based on what other variables are included)
-# (should just compute one column at a time)
-
-# cluster 1
-colMeans((df_figures |> filter(cluster=="1"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
-
-# cluster 2
-colMeans((df_figures |> filter(cluster=="2"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
-
-# cluster 3
-colMeans((df_figures |> filter(cluster=="3"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
-
-# cluster 4
-colMeans((df_figures |> filter(cluster=="4"))[,c("AHI","age_at_enrollment","PFNTOTL","BSRT_SumRecall","isMale","isWhite","BMI")])
-
-```
-
-```{r}
-# summarize other variables
+# summarize other variables by cluster
 
 # AHI
 df_figures |>
@@ -995,21 +861,6 @@ summary(lm(PFNTOTL ~ age_at_enrollment + isMale + AHI, data=df_pfn))
 summary(lm(BSRT_SumRecall ~ AHI + age_at_enrollment + isMale, data=df_bsrt))
 ```
 
-
-
-```{r}
-# adding highest grade (complete case)
-df_pfn <- df_figures |>
-  filter(PFNTOTL > 0)
-df_pfn <- within(df_pfn, cluster <- relevel(cluster, ref=4))
-summary(lm(PFNTOTL ~ age_at_enrollment + isMale + cluster, data=df_pfn))
-
-df_bsrt_grade <- df_figures |>
-  filter(BSRT_SumRecall > 0) |>
-  filter(HighestGradeHP > 0)
-df_bsrt_grade <- within(df_bsrt_grade, cluster <- relevel(cluster, ref=4))
-summary(lm(BSRT_SumRecall ~ age_at_enrollment + isMale + HighestGradeHP + cluster, data=df_bsrt_grade))
-```
 
 
 ```{r}

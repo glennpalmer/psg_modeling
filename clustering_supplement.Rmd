@@ -1,0 +1,535 @@
+---
+title: "Additional clustering methods"
+author: "Glenn Palmer"
+date: "2025-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mclust)
+```
+
+## Additional clustering methodology -- for the Supplemental Information
+
+This notebook computes (1) an alternate clustering point estimate, Bayes-optimal based on optimizing over only the cluster assignments but allowing the cluster centers to vary by posterior sample, (2) alternate UQ for the clustering point estimate in the main paper based on the generalized Bayesian approach of Rigon et al. (2023), and (3) alternate UQ for the clustering point estimate in the main paper based on simply running k-means for each posterior sample separately.
+
+## (1) Alternate point estimation
+
+```{r}
+# load posterior samples to use for clustering (same as from model fit above)
+joint_fit_factor <- readRDS("joint_fit_factor_k5_n1093_m2500_chain4.rds")
+
+# extract posterior samples and visualize
+post_samples_event <- extract(joint_fit_factor)
+```
+
+```{r}
+# organize posterior samples of theta
+m <- 10000
+N <- 1093
+d <- 10
+theta_samples <- array(dim=c(10,N,m))
+for (l in 1:m) {
+  for (i in 1:N) {
+    theta_samples[1:8,i,l] <- as.vector(post_samples_event$gamma_alpha[l,((i-1)*4 + 1):(i*4),1:2])
+    theta_samples[9,i,l] <- post_samples_event$phi_R[l,i]
+    theta_samples[10,i,l] <- post_samples_event$phi_N[l,i]
+  }
+}
+```
+
+```{r}
+# compute theta_tilde
+theta_tilde <- matrix(nrow=N, ncol=m*d)
+for (i in 1:N) {
+  for (j in 1:m) {
+    for (l in 1:d) {
+      theta_tilde[i, (j-1)*d + l] <- theta_samples[l,i,j]
+    }
+  }
+}
+```
+
+
+```{r}
+##### get cluster labels (Bayes optimal)
+
+# run k-means using posterior means
+km.out.bayes.alt <- kmeans(theta_tilde, centers=4, nstart=50)
+label_init_alt <- km.out.bayes.alt$cluster
+label_init_alt
+km.out.bayes.alt$size
+```
+
+```{r}
+# plot patient posterior means of different pairs of REs
+df_figures$cluster.alt <- as.factor(label_init_alt)
+
+# plot clusters on scatterplot of principal components
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=cluster.alt)) +
+  geom_point() +
+  labs(title="Bayes-optimal clustering (alt with centers varying over posterior)",
+       x="pc1")
+```
+
+```{r}
+# compute adjusted Rand index with main clustering results from paper
+adjustedRandIndex(df_figures$cluster, df_figures$cluster.alt)
+```
+
+
+
+## Alternate UQ #1 (Rigon et al., 2023)
+
+
+```{r}
+# helper functions for clustering gibbs sampler
+
+##### compute sum of squares loss for a given matrix of observations (N rows, d columns)
+SSE <- function(obs_mat) {
+  obs_mat_colMeans <- colMeans(obs_mat)
+  #return(sum(t(t(obs_mat) - obs_mat_colMeans)^2) / m)
+  return(sum(t(t(obs_mat) - obs_mat_colMeans)^2))
+}
+
+#### compute term proportional to Pr(c_i = k) for a given pair of loss values and a lambda value
+rho_ratio <- function(loss_num, loss_denom, lambda) {
+  return(exp(-1 * lambda * loss_num + lambda * loss_denom))
+}
+
+log_rho_ratio <- function(loss_num, loss_denom, lambda) {
+  return(-1 * lambda * loss_num + lambda * loss_denom)
+}
+
+#### compute vector of Pr(c_i = k) for a given list of log rho ratios
+get_prob_vec <- function(rho_ratio_vec) {
+  prob_vec <- rep(NA, length(rho_ratio_vec))
+  for (i in 1:length(prob_vec)) {
+    prob_vec[i] <- rho_ratio_vec[i] / sum(rho_ratio_vec)
+  }
+  return(prob_vec)
+}
+
+get_prob_vec_from_log <- function(log_rho_ratio_vec) {
+  prob_vec <- rep(NA, length(log_rho_ratio_vec))
+  for (i in 1:length(prob_vec)) {
+    prob_vec[i] <- 1 / (1 + sum(exp(log_rho_ratio_vec[-i] - log_rho_ratio_vec[i])))
+  }
+  return(prob_vec)
+}
+
+#### generate sample of cluster label given a vector of probabilities
+get_c_i <- function(prob_vec) {
+  return(sample(x=1:length(prob_vec), 1, prob=prob_vec))
+}
+
+#### generate sample of lambda given a_lambda, b_lambda, N, d, and a vector of squared errors
+get_lambda <- function(N, d, a_lambda, b_lambda, total_WSSE) {
+  curr_shape <- a_lambda + N*d/2
+  curr_rate <- b_lambda + total_WSSE
+  curr_sample <- rgamma(n=1, shape=curr_shape, rate=curr_rate)
+  return(curr_sample)
+}
+
+#### generate sample of lambda given k, a current theta vector, and a current set of cluster labels
+sample_lambda <- function(N, d, a_lambda, b_lambda, k, theta_mat, label_vec) {
+  # get total WSSE
+  WSSE_vec <- rep(NA, k)
+  for (i in 1:k) {
+    #print(theta_mat[which(label_vec==i),])
+    WSSE_vec[i] <- SSE(theta_mat[which(label_vec==i),])
+    #print(WSSE_vec)
+  }
+  total_WSSE <- sum(WSSE_vec)
+  
+  # draw sample and return
+  curr_sample <- get_lambda(N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda, total_WSSE=total_WSSE)
+  return(curr_sample)
+}
+
+#### generate sample of c_i given k, lambda, theta_minus_i, theta_i, label_minus_i
+sample_c_i <- function(k, lambda, theta_minus_i, theta_i, label_minus_i) {
+  rho_ratio_vec <- rep(NA, k)
+  for (i in 1:k) {
+    loss_num <- SSE(rbind(theta_minus_i[which(label_minus_i == i),], theta_i))
+    #print(loss_num)
+    #print(loss_num)
+    #SSE(theta_minus_i[which(label_minus_i==i),])
+    loss_denom <- SSE(theta_minus_i[which(label_minus_i==i),])
+    #print(loss_denom)
+    #print(loss_denom)
+    rho_ratio_vec[i] <- rho_ratio(loss_num=loss_num, loss_denom=loss_denom, lambda=lambda)
+  }
+  #print(rho_ratio_vec)
+  
+  prob_vec <- get_prob_vec(rho_ratio_vec)
+  #print(prob_vec)
+  
+  curr_sample <- get_c_i(prob_vec)
+  
+  return(curr_sample)
+}
+
+sample_c_i_with_log <- function(k, lambda, theta_minus_i, theta_i, label_minus_i) {
+  log_rho_ratio_vec <- rep(NA, k)
+  for (i in 1:k) {
+    loss_num <- SSE(rbind(theta_minus_i[which(label_minus_i == i),], theta_i))
+    #print(loss_num)
+    #print(loss_num)
+    #SSE(theta_minus_i[which(label_minus_i==i),])
+    loss_denom <- SSE(theta_minus_i[which(label_minus_i==i),])
+    #print(loss_denom)
+    #print(loss_denom)
+    log_rho_ratio_vec[i] <- log_rho_ratio(loss_num=loss_num, loss_denom=loss_denom, lambda=lambda)
+  }
+  #print(log_rho_ratio_vec)
+  
+  prob_vec <- get_prob_vec_from_log(log_rho_ratio_vec)
+  #print(prob_vec)
+  
+  curr_sample <- get_c_i(prob_vec)
+  
+  return(curr_sample)
+}
+```
+
+```{r}
+#### set hyperparameter values
+k <- 4
+N <- 1093
+m <- 10000
+d <- 10
+a_lambda <- 1
+b_lambda <- 1
+```
+
+
+```{r}
+##### get initial cluster labels (Bayes optimal)
+label_init <- as.integer(df_figures$cluster)
+```
+
+
+```{r}
+##### function to run one iteration of sampler given previous values of lambda and the clustering
+gibbs_iteration <- function(k, N, d, a_lambda, b_lambda,
+                            label_prev, theta_mat) {
+  
+  ## draw new lambda value
+  lambda_new <- sample_lambda(N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda, k=k,
+                              theta_mat=theta_mat, label_vec=label_prev)
+  
+  ## loop over patients, drawing new label_vec
+  label_new <- label_prev
+  for (i in 1:N) {
+    theta_i <- theta_mat[i,]
+    theta_minus_i <- theta_mat[-i,]
+    label_minus_i <- label_new[-i]
+    label_new[i] <- sample_c_i_with_log(k=k, lambda=lambda_new, theta_minus_i=theta_minus_i, theta_i=theta_i, label_minus_i=label_minus_i)
+    #label_new[i] <- sample_c_i(k=k, lambda=lambda_new, theta_minus_i=theta_minus_i, theta_i=theta_i, label_minus_i=label_minus_i)
+  }
+  
+  return(list(lambda_new, label_new))
+}
+```
+
+
+```{r}
+############### run full sampler -- posterior means of theta #################
+
+# set number of clustering samples
+cluster_sample_num <- 10000
+
+# set initial lambda
+lambda_init <- 1
+
+# initialize data storage
+C_post_mat <- matrix(nrow=cluster_sample_num, ncol=N)
+lambda_post_vec <- rep(NA, cluster_sample_num)
+
+# populate initial values
+C_post_mat[1,] <- label_init
+lambda_post_vec[1] <- lambda_init
+
+for (i in 2:cluster_sample_num) {
+  new_sample <- gibbs_iteration(k=k, N=N, d=d, a_lambda=a_lambda, b_lambda=b_lambda,
+                                label_prev=C_post_mat[(i-1),], theta_mat=theta_postmean)
+  
+  C_post_mat[i,] <- new_sample[[2]]
+  lambda_post_vec[i] <- new_sample[[1]]
+}
+```
+
+
+```{r}
+# visualize pairwise probabilities of co-clusters
+co_prob_mat <- matrix(nrow=N, ncol=N)
+for (i in 1:N) {
+  for (j in 1:N) {
+    co_prob_mat[i,j] <- sum(C_post_mat[,i] == C_post_mat[,j]) / cluster_sample_num
+  }
+}
+```
+
+```{r}
+heatmap(co_prob_mat[c(which(label_init==3), which(label_init==4), which(label_init==2), which(label_init==1)),
+                    c(which(label_init==3), which(label_init==4), which(label_init==2), which(label_init==1))],
+        Colv=NA, Rowv=NA, scale="none",
+        main="Co-clustering probabilities (Gibbs posterior UQ)")
+```
+
+
+```{r}
+# compute closest points to each of the cluster centers
+
+get_closest_point_index <- function(cluster, theta_mat, label_vec) {
+  theta_curr <- theta_mat[which(label_vec==cluster),]
+  center_curr <- colMeans(theta_curr)
+  curr_best_dist <- sum((theta_mat[1,] - center_curr)^2)
+  curr_best_index <- 1
+  for (i in 2:nrow(theta_mat)) {
+    curr_dist <- sum((theta_mat[i,] - center_curr)^2)
+    if (curr_dist < curr_best_dist) {
+      curr_best_dist <- curr_dist
+      curr_best_index <- i
+    }
+  }
+  return(curr_best_index)
+}
+
+# get indices of points closest to each cluster center
+c1_index <- get_closest_point_index(1, theta_postmean, label_init)
+c2_index <- get_closest_point_index(2, theta_postmean, label_init)
+c3_index <- get_closest_point_index(3, theta_postmean, label_init)
+c4_index <- get_closest_point_index(4, theta_postmean, label_init)
+
+c1_index
+c2_index
+c3_index
+c4_index
+```
+```{r}
+# verify that these points are always in the designated cluster (almost)
+plot(C_post_mat[,c1_index], type="l")
+plot(C_post_mat[,c2_index], type="l")
+plot(C_post_mat[,c3_index], type="l")
+plot(C_post_mat[,c4_index], type="l")
+```
+
+
+```{r}
+# make plot with probability of being in each cluster
+df_figures$type2_cluster1prob <- co_prob_mat[c1_index,]
+df_figures$type2_cluster2prob <- co_prob_mat[c2_index,]
+df_figures$type2_cluster3prob <- co_prob_mat[c3_index,]
+df_figures$type2_cluster4prob <- co_prob_mat[c4_index,]
+```
+
+
+```{r}
+# assignment probability plots -- Type 2
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster1prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster2prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster3prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Generalized Bayes UQ",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type2_cluster4prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Type 2 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+```
+
+
+# Clustering UQ comparison
+
+```{r}
+# add a variable for the probabilities of being assigned to the cluster point estimate
+df_figures <- df_figures |>
+  mutate(prob_assigned_type1 = case_when(
+    cluster == "1" ~ type1_cluster1prob,
+    cluster == "2" ~ type1_cluster2prob,
+    cluster == "3" ~ type1_cluster3prob,
+    cluster == "4" ~ type1_cluster4prob
+  )) |>
+  mutate(prob_assigned_type2 = case_when(
+    cluster == "1" ~ type2_cluster1prob,
+    cluster == "2" ~ type2_cluster2prob,
+    cluster == "3" ~ type2_cluster3prob,
+    cluster == "4" ~ type2_cluster4prob
+  ))
+```
+
+```{r}
+# make dataframe for plotting
+sorted_type1_prob <- df_figures$prob_assigned_type1[order(df_figures$prob_assigned_type2)]
+sorted_type2_prob <- df_figures$prob_assigned_type2[order(df_figures$prob_assigned_type2)]
+df_compare_uq <- data.frame(1:nrow(df_figures),
+                            rep(c("Type 1", "Type 2"), each=nrow(df_figures)),
+                            c(sorted_type1_prob, sorted_type2_prob))
+names(df_compare_uq) <- c("Patient", "UQ_Type", "Prob_Assigned")
+
+# make plot
+ggplot(df_compare_uq, aes(x=Patient, y=Prob_Assigned, color=UQ_Type)) +
+  geom_point() +
+  labs(title="Cluster assignment probabilities -- Type 1 vs. 2 uncertainty",
+       x="Patient index (sorted by increasing Type 2 assignment probability)",
+       y="Probability of assigned cluster")
+
+# scatter plot instead
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=total_sleep)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="red",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  scale_color_continuous(type="viridis")
+
+
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=time_in_REM)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="red",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  scale_color_continuous(type="viridis")
+
+ggplot(df_figures, aes(x=prob_assigned_type1, y=prob_assigned_type2, color=cluster)) +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="black",
+              size=1) +
+  geom_point() +
+  xlim(0,1) +
+  ylim(0,1) +
+  labs(title="Probability of assignment to cluster point estimate",
+       x="Type 1 assignment probability",
+       y="Type 2 assignment probability")
+
+```
+
+
+## Alternate UQ #2 (Running k-means separately on each posterior sample)
+
+```{r}
+# define storage for clusterings
+C_separate_mat <- matrix(nrow=10000, ncol=1093)
+
+# run kmeans for each posterior sample
+for (i in 1:10000) {
+  curr_clustering <- kmeans(t(theta_samples[,,i]), centers=4, nstart=50)
+  C_separate_mat[i,] <- curr_clustering$cluster
+}
+```
+
+```{r}
+# visualize pairwise probabilities of co-clusters
+co_prob_mat2 <- matrix(nrow=N, ncol=N)
+for (i in 1:N) {
+  for (j in 1:N) {
+    co_prob_mat2[i,j] <- sum(C_separate_mat[,i] == C_separate_mat[,j]) / 10000
+  }
+}
+```
+
+```{r}
+heatmap(co_prob_mat2[c(which(label_init==3), which(label_init==4), which(label_init==2), which(label_init==1)),
+                    c(which(label_init==3), which(label_init==4), which(label_init==2), which(label_init==1))],
+        Colv=NA, Rowv=NA, scale="none",
+        main="Co-clustering probabilities (Separate K-means for each sample)")
+```
+
+```{r}
+# make plot with probability of being in each cluster
+df_figures$type3_cluster1prob <- co_prob_mat2[c1_index,]
+df_figures$type3_cluster2prob <- co_prob_mat2[c2_index,]
+df_figures$type3_cluster3prob <- co_prob_mat2[c3_index,]
+df_figures$type3_cluster4prob <- co_prob_mat2[c4_index,]
+```
+
+
+```{r}
+# assignment probability plots -- Type 3
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type3_cluster1prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Type 3 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type3_cluster2prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 2 -- Type 3 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type3_cluster3prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 1 -- Separate K-means for each sample",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type3_cluster4prob)) +
+  geom_point() +
+  labs(title="Probability of being in cluster 4 -- Type 3 uncertainty",
+       x="pc1") +
+  scale_color_continuous(type="viridis", limits=c(0,1)) +
+  theme(legend.title=element_blank())
+```
+
+
+```{r}
+# compute adjusted rand index of point estimate with each sample's clustering
+type2_ARI <- rep(NA, 9999)
+type3_ARI <- rep(NA, 9999)
+
+for (i in 2:10000) {
+  type2_ARI[i-1] <- adjustedRandIndex(df_figures$cluster, C_post_mat[i,])
+  type3_ARI[i-1] <- adjustedRandIndex(df_figures$cluster, C_separate_mat[i,])
+}
+
+mean(type2_ARI)
+sd(type2_ARI)
+max(type2_ARI)
+min(type2_ARI)
+
+mean(type3_ARI)
+sd(type3_ARI)
+max(type3_ARI)
+min(type3_ARI)
+```
+
+```{r}
+hist(type2_ARI)
+hist(type3_ARI)
+```
+
+
+
+
+
+
