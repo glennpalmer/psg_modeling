@@ -1,0 +1,821 @@
+---
+title: "Posterior predictive checks"
+author: "Glenn Palmer"
+date: "2025-01-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+In this notebook, I simulate posterior predictive distributions of PSG summaries for each patient using the posterior samples computed in joint_model_factor_k5.Rmd.
+
+Note: Saved Stan fit is joint_fit_factor_n1093_m2500_chain4.rds.
+
+Note: Extracted posterior samples saved as post_samples_event.
+
+
+```{r}
+# create matrix of posterior samples for all fixed effects
+fixed_effect_samples <- matrix(nrow=10000, ncol=10)
+colnames(fixed_effect_samples) <- c(as.vector(t(matrix(c("mu_RA", "mu_RN",
+                             "mu_NA", "mu_NR",
+                             "tau_RA", "tau_RN",
+                             "tau_NA", "tau_NR"),
+                             nrow=2, ncol=4))),
+                             c("lambda_R", "lambda_N"))
+#colnames(fixed_effect_samples)[9:10] <- c("lambda_R", "lambda_N")
+
+for (i in 1:10000) {
+  fixed_effect_samples[i,1:8] <- as.vector(post_samples_event$mu_tau[i,,])
+  fixed_effect_samples[i,9] <- post_samples_event$lambda_R[i]
+  fixed_effect_samples[i,10] <- post_samples_event$lambda_N[i]
+}
+
+colnames(fixed_effect_samples)
+```
+
+```{r}
+# create array of posterior samples for all patient level random effects
+random_effect_samples <- array(dim=c(10000,1093,10))
+RE_names <- c(as.vector(t(matrix(c("gamma_RA", "gamma_RN",
+                             "gamma_NA", "gamma_NR",
+                             "alpha_RA", "alpha_RN",
+                             "alpha_NA", "alpha_NR"),
+                           nrow=2, ncol=4))),
+              c("phi_R", "phi_N"))
+
+for (i in 1:10000) {
+  for (j in 1:1093) {
+    random_effect_samples[i,j,(1:8)] <-
+      as.vector(post_samples_event$gamma_alpha[i,((j-1)*4 + 1:4),(1:2)])
+    random_effect_samples[i,j,9] <- post_samples_event$phi_R[i,j]
+    random_effect_samples[i,j,10] <- post_samples_event$phi_N[i,j]
+  }
+}
+
+RE_names
+```
+
+
+```{r}
+# for each patient, get the list of starting stages (stages coming after Awake),
+# and the list of event durations for events occurring in each sleep stage
+
+# (Editing the original code to import patients from joint_model_factor_k5.Rmd.)
+
+get_single_patient_pp_vecs <- function(id_number) {
+  ########### get stage_df and epoch_vec set up correctly ##########
+  
+  # set patient_num
+  patient_num <- id_number
+  
+  # import stage_df
+  stage_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, "STAGE.csv"))
+  names(stage_df) <- c("stage")
+  stage_df <- stage_df |>
+    dplyr::select(stage)
+  
+  # import events df
+  event_df <- read_csv(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".csv"))
+  names(event_df)<-str_replace_all(names(event_df), c(" " = "." , "," = "" ))
+  
+  # exclude outages from event_df
+  event_df <- event_df |>
+    dplyr::filter(Event.type != "'tech out\",W\"")
+  
+  # Convert sleep stages in event_df to have same format as stage_df
+  event_df <- event_df |>
+    dplyr::mutate(stageval = case_when(
+      Stage == "W" ~ 11,
+      Stage == "R" ~ 12,
+      Stage == "N1" ~ 13,
+      Stage == "N2" ~ 14,
+      Stage == "N3" ~ 15
+    ))
+  
+  # create epoch counter vector -- first epoch 29 seconds
+  epoch_vec <- c(rep(1,29), rep(2:1500, each=30))
+  
+  # pull out stage_vec from stage_df
+  stage_vec <- stage_df$stage
+  
+  # check that the transitions in sleep stages and epochs are lined up
+  stage_vec <- check_and_prepend_alignment(stage_vec)
+  
+  # loop over event stage/epoch pairs and make sure they're aligned
+  eventstage_vec <- as.numeric(event_df$stageval)
+  eventepoch_vec <- as.numeric(event_df$Epoch)
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align != 0) {
+    stage_vec <- 
+      align_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  } 
+  check_align <- check_epoch_stage_pairs(stage_vec, epoch_vec, eventstage_vec, eventepoch_vec)
+  if (check_align == 0) {
+    print("Epoch and stage alignment successful!")
+  }
+  if (check_align != 0) {
+    print(paste0("Epoch and stage alignment failed for patient ", patient_num, "."))
+    return(1)
+  }
+  
+  
+  # Add values to end of a few patients requiring it
+  if (patient_num %in% c(250145, 440032, 450071, 450098)) {
+    stage_vec <- c(stage_df$stage, 14)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }
+  if (patient_num %in% c(440048)) {
+    stage_vec <- c(stage_df$stage, 13)
+    stage_df <- data.frame(stage_vec)
+    names(stage_df) <- c("stage")
+  }  
+  
+  
+  
+  #### Get apnea events aligned and added
+  
+  # filter event_df for apnea events
+  event_df <- event_df |>
+    filter(Event.type == "Hypopnea" | Event.type == "Obstructive apnea" | Event.type == "Central apnea" | Event.type == "Mixed apnea")
+  
+  # Some patients have times using AM/PM -- convert as needed
+  if (patient_num == 240094) {
+    for (i in 1:nrow(event_df)) {
+      # super messy way to convert am/pm to military time string
+      event_df$Time[i] <- substring(as.character(parse_date_time(event_df$Time[i],
+                                                                 '%I:%M:%S %p')),
+                                    nchar(as.character(parse_date_time(event_df$Time[i],
+                                                                       '%I:%M:%S %p'))) - 8 + 1)
+    }
+    event_df$Time <- hms(event_df$Time)
+  }
+  
+  # import start time from edf file
+  starttime <- readEdfHeader(paste0("/Users/glennpalmer/Desktop/sleep_research_2024/apples/original/PSG Exports/apples-", patient_num, ".edf"))$startTime
+  
+  # put start_time in same format as other fake times
+  starttime_vec <- c(NA, 1)
+  if (hour(starttime) > 16) {
+    starttime_vec[1] <- ISOdate(year=1, month=1, day=1,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime))
+  }
+  if (hour(starttime) <= 16) {
+    starttime_vec[1] <- c(ISOdate(year=1, month=1, day=2,
+                         hour=hour(starttime),
+                         min=minute(starttime),
+                         sec=second(starttime)))
+  }
+  starttime <- starttime_vec[1]
+  
+  # make event_time and event_faketime vectors and populate
+  event_time <- event_df$Time
+  event_faketime <- rep(NA, length(event_time))
+  for (i in 1:length(event_time)) {
+    if (hour(event_time[i]) > 16 & patient_num != 140095) {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=1,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+    else {
+      event_faketime[i] <- ISOdate(year=1, month=1, day=2,
+                       hour=hour(event_time[i]),
+                       min=minute(event_time[i]),
+                       sec=second(event_time[i]))
+    }
+  }
+  
+  # compute event index
+  event_index <- event_faketime - starttime
+  
+  # check that events are placed in correct epochs
+  eventepoch_vec <- event_df$Epoch
+  for (i in 1:length(event_index)) {
+    #print(paste0("Checking event ", i, "."))
+    if (event_index[i] == 0) {
+      if (eventepoch_vec[i] != 1) {
+        print(paste0("Incorrect epoch for event ", i, "."))
+        return(1)
+      }
+    }
+    else if (epoch_vec[event_index[i]] != eventepoch_vec[i]) {
+      print(paste0("Incorrect epoch for event ", i, "."))
+      return(1)
+    }
+  }
+  
+  # get durations
+  event_durations <- as.integer(ceiling(as.numeric(word(event_df$Duration, 1))))
+  
+  # create binary vector with indicator of event currently happening
+  event_happening <- rep(0, length(stage_vec))
+  for (i in 1:length(event_index)) {
+    if (event_index[i] != 0) {
+    event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,event_durations[i])
+    }
+    else {
+      event_happening[event_index[i]:(event_index[i] + event_durations[i] - 1)] <-
+      rep(1,(event_durations[i] - 1))
+    }
+  }
+  # cut off final indices of event_happening if it goes beyond the length of stage_vec
+  event_happening <- event_happening[1:length(stage_vec)]
+  
+  
+  # create counter vector for cumulative number of events
+  cum_event_vec <- rep(NA, length(stage_vec))
+  curr_count <- 0
+  for (i in 1:length(stage_vec)) {
+    if (event_happening[i] == 1) {
+      if (i == 1) {
+        curr_count <- curr_count + 1
+      }
+      else if (event_happening[i-1] == 0) {
+        curr_count <- curr_count + 1
+      }
+    }
+    cum_event_vec[i] <- curr_count
+  }
+  
+  # create updated stage_df
+  stage_df <- data.frame(stage_vec, epoch_vec[1:length(stage_vec)], event_happening, cum_event_vec)
+  names(stage_df) <- c("stage", "epoch", "event", "cum_events")  
+  
+  
+  
+  # proceed as usual
+  
+  # Collapse non-REM stages
+  stage_df <- stage_df |>
+    mutate(stage = case_when(
+      stage == 11 ~ 11,
+      stage == 12 ~ 12,
+      stage >= 13 ~ 13
+    ))
+  
+  # update stage_vec
+  stage_vec <- stage_df$stage
+  
+  # At this point, stage_df provides enough to get the necessary info for modeling interevent times
+  qR <- 0 # number of seconds spent in REM (excluding time during events except the second of onset)
+  vR <- 0 # number of apnea/hypopnea events in REM
+  qN <- 0 # number of seconds spend in non-REM sleep (excluding time during events except the second of onset)
+  vN <- 0 # number of apnea/hypopnea events in non-REM sleep
+  
+  ### UPDATE: Goal is to get a vector of event lengths for each sleep stage, and a vector
+  ### of starting stages coming after Awake
+  starting_stages <- c()
+  event_durations_REM <- c()
+  event_durations_nonREM <- c()
+  curr_event_length <- 0
+  curr_event_stage <- stage_vec[1]
+  
+  for (i in 2:nrow(stage_df)) {
+    if (stage_vec[i-1] == 11) {
+      if (stage_vec[i] == 12) {
+        starting_stages <- c(starting_stages, 12)
+      }
+      else if (stage_vec[i] == 13) {
+        starting_stages <- c(starting_stages, 13)
+      }
+    }
+    if (event_happening[i] == 1 & event_happening[i-1] == 0) {
+      curr_event_stage <- stage_vec[i]
+      curr_event_length <- 1
+    }
+    else if (event_happening[i] == 1 & event_happening[i-1] == 1) {
+      curr_event_length <- curr_event_length + 1
+    }
+    else if (event_happening[i] == 0 & event_happening[i-1] == 1) {
+      if (curr_event_stage == 12) {
+        event_durations_REM <- c(event_durations_REM, curr_event_length)
+      }
+      else if (curr_event_stage == 13) {
+        event_durations_nonREM <- c(event_durations_nonREM, curr_event_length)
+      }
+      curr_event_length <- 0
+      curr_event_stage <- NA
+    }
+  }
+  
+  # return data
+  return(list(starting_stages, event_durations_REM, event_durations_nonREM))
+}
+```
+
+```{r}
+# check to see if it's working -- seems right
+get_single_patient_pp_vecs(140014)
+```
+
+
+```{r}
+# get the above vectors for a list of patients
+get_multiple_patient_pp_vecs <- function(id_numbers) {
+  N <- length(id_numbers)
+  
+  # initialize lists to populate with the relevant vectors
+  starting_stage_vec_list <- vector("list", N)
+  event_durations_REM_vec_list <- vector("list", N)
+  event_durations_nonREM_vec_list <- vector("list", N)
+  
+  # loop over the patients
+  for (i in 1:N) {
+    print(paste0("Importing patient id ", id_numbers[i], "(Patient ", i, ")"))
+    curr_data <- get_single_patient_pp_vecs(id_numbers[i])
+    starting_stage_vec_list[[i]] <- curr_data[[1]]
+    event_durations_REM_vec_list[[i]] <- curr_data[[2]]
+    event_durations_nonREM_vec_list[[i]] <- curr_data[[3]]
+  }
+  
+  # return the results
+  return(list(starting_stage_vec_list,
+              event_durations_REM_vec_list,
+              event_durations_nonREM_vec_list))
+}
+```
+
+```{r message=FALSE}
+# Import all patients
+pp_check_vecs <- get_multiple_patient_pp_vecs(patient_ids)
+names(pp_check_vecs) <- c("starting_stage_vec",
+                          "event_durations_REM_vec",
+                          "event_durations_nonREM_vec")
+```
+
+
+```{r}
+# function to simulate a single night of data for one patient
+
+sim_night <- function(fixed_vec,
+                      random_vec,
+                      starting_stage_vec,
+                      event_durations_REM_vec,
+                      event_durations_nonREM_vec,
+                      epochs_asleep) {
+  
+  # create vector for epoch-level sleep stages
+  sleep_stage_sim <- rep(NA, epochs_asleep)
+  
+  # create vector for event durations in REM and non-REM
+  REM_event_durations_sim <- c()
+  nonREM_event_durations_sim <- c()
+  
+  # make sure the REM vector isn't empty -- if it is, just make any events last 10 seconds
+  if (length(event_durations_REM_vec) == 0) {
+    event_durations_REM_vec <- c(10)
+  }
+  
+  # simulate way too many inter-event times and event durations -- maybe 2000 for
+  # each sleep stage? Then I can just draw upon those as needed. (Many may be censored.)
+  REM_durations_latent <- sample(event_durations_REM_vec, size=2000, replace=TRUE)
+  nonREM_durations_latent <- sample(event_durations_nonREM_vec, size=2000, replace=TRUE)
+  REM_interevent_times_latent <- rexp(n=2000, rate=(fixed_vec[9] * exp(random_vec[9])))
+  nonREM_interevent_times_latent <- rexp(n=2000, rate=(fixed_vec[10] * exp(random_vec[10])))
+  
+  # compute the transition probabilities for rem and non-REM given that there is or is
+  # not an event currently happening
+  # for all vecs, the probabilities represent (11,12,13)
+  REM_transition_prob <- rep(NA,3)
+  REM_transition_prob_event <- rep(NA,3)
+  nonREM_transition_prob <- rep(NA,3)
+  nonREM_transition_prob_event <- rep(NA,3)
+  
+  # REM, no event
+  REM_transition_prob[1] <- exp(fixed_vec[1] + random_vec[1]) /
+    (1 + exp(fixed_vec[1] + random_vec[1]) + exp(fixed_vec[5] + random_vec[5]))
+  REM_transition_prob[2] <- 1 /
+    (1 + exp(fixed_vec[1] + random_vec[1]) + exp(fixed_vec[5] + random_vec[5]))
+  REM_transition_prob[3] <- exp(fixed_vec[5] + random_vec[5]) /
+    (1 + exp(fixed_vec[1] + random_vec[1]) + exp(fixed_vec[5] + random_vec[5]))
+  
+  # REM, event
+  REM_transition_prob_event[1] <- exp(fixed_vec[1] + random_vec[1] + fixed_vec[3] + random_vec[3]) /
+    (1 + exp(fixed_vec[1] + random_vec[1] + fixed_vec[3] + random_vec[3]) +
+       exp(fixed_vec[5] + random_vec[5] + fixed_vec[7] + random_vec[7]))
+  REM_transition_prob_event[2] <- 1 /
+    (1 + exp(fixed_vec[1] + random_vec[1] + fixed_vec[3] + random_vec[3]) +
+       exp(fixed_vec[5] + random_vec[5] + fixed_vec[7] + random_vec[7]))
+  REM_transition_prob_event[3] <- exp(fixed_vec[5] + random_vec[5] + fixed_vec[7] + random_vec[7]) /
+    (1 + exp(fixed_vec[1] + random_vec[1] + fixed_vec[3] + random_vec[3]) +
+       exp(fixed_vec[5] + random_vec[5] + fixed_vec[7] + random_vec[7]))
+  
+  # nonREM, no event
+  nonREM_transition_prob[1] <- exp(fixed_vec[2] + random_vec[2]) /
+    (1 + exp(fixed_vec[2] + random_vec[2]) + exp(fixed_vec[6] + random_vec[6]))
+  nonREM_transition_prob[2] <- exp(fixed_vec[6] + random_vec[6]) /
+    (1 + exp(fixed_vec[2] + random_vec[2]) + exp(fixed_vec[6] + random_vec[6]))
+  nonREM_transition_prob[3] <- 1 /
+    (1 + exp(fixed_vec[2] + random_vec[2]) + exp(fixed_vec[6] + random_vec[6]))
+  
+  # nonREM, no event
+  nonREM_transition_prob_event[1] <- exp(fixed_vec[2] + random_vec[2] + fixed_vec[4] + random_vec[4]) /
+    (1 + exp(fixed_vec[2] + random_vec[2] + fixed_vec[4] + random_vec[4]) +
+       exp(fixed_vec[6] + random_vec[6] + fixed_vec[8] + random_vec[8]))
+  nonREM_transition_prob_event[2] <- exp(fixed_vec[6] + random_vec[6] + fixed_vec[8] + random_vec[8]) /
+    (1 + exp(fixed_vec[2] + random_vec[2] + fixed_vec[4] + random_vec[4]) +
+       exp(fixed_vec[6] + random_vec[6] + fixed_vec[8] + random_vec[8]))
+  nonREM_transition_prob_event[3] <- 1 /
+    (1 + exp(fixed_vec[2] + random_vec[2] + fixed_vec[4] + random_vec[4]) +
+       exp(fixed_vec[6] + random_vec[6] + fixed_vec[8] + random_vec[8]))
+  
+  # always start the night with non-REM sleep
+  sleep_stage_sim[1] <- 13
+  
+  # alternate between simulating (possibly censored) events and sleep stage transitions
+  curr_epoch <- 1
+  num_events_REM <- 0
+  num_events_nonREM <- 0
+  next_event_start <- nonREM_interevent_times_latent[1]
+  next_event_end <- nonREM_interevent_times_latent[1] + nonREM_durations_latent[1]
+  REM_event_index <- 1
+  nonREM_event_index <- 2
+  
+  ##### some extra things to record to figure out what's going wrong
+  ##### (Note: I didn't actually implement these because I found a bug)
+  # transition counts
+  RA_count <- 0
+  RN_count <- 0
+  RR_count <- 0
+  NA_count <- 0
+  NR_count <- 0
+  NN_count <- 0
+  AR_count <- 0
+  AN_count <- 0
+  # time spent with and without events in each stage
+  REM_time_noevent <- 0
+  nonREM_time_noevent <- 0
+  
+  
+  while (curr_epoch < epochs_asleep) {
+    # if event hasn't happened yet, draw the next stage and increment the epoch
+    if (ceiling(next_event_start / 30) > curr_epoch) {
+      if (sleep_stage_sim[curr_epoch] == 12) {
+        sleep_stage_sim[curr_epoch + 1] <- sample(x=c(11,12,13), size=1, prob=REM_transition_prob)
+      }
+      else if (sleep_stage_sim[curr_epoch] == 13) {
+        sleep_stage_sim[curr_epoch + 1] <- sample(x=c(11,12,13), size=1, prob=nonREM_transition_prob)
+      }
+      curr_epoch <- curr_epoch + 1
+      if (sleep_stage_sim[curr_epoch] != sleep_stage_sim[curr_epoch-1]) {
+        # if they switch stages, only draw a new event if there was not currently an event happening
+        if (sleep_stage_sim[curr_epoch] == 12) {
+          next_event_start <- (curr_epoch-1) * 30 + REM_interevent_times_latent[REM_event_index]
+          next_event_end <- next_event_start + REM_durations_latent[REM_event_index]
+          REM_event_index <- REM_event_index + 1
+        }
+        else if (sleep_stage_sim[curr_epoch] == 13) {
+          next_event_start <- (curr_epoch-1) * 30 + nonREM_interevent_times_latent[nonREM_event_index]
+          next_event_end <- next_event_start + nonREM_durations_latent[nonREM_event_index]
+          nonREM_event_index <- nonREM_event_index + 1
+        }
+      }
+    }
+    
+    # if event is occurring in the current epoch, account for this in the transition
+    else if (ceiling(next_event_start / 30) <= curr_epoch) { 
+      # if the event starts here, increment the appropriate counter
+      if (ceiling(next_event_start / 30) == curr_epoch) {
+        if (sleep_stage_sim[curr_epoch] == 12) {
+          num_events_REM <- num_events_REM + 1
+        }
+        else if (sleep_stage_sim[curr_epoch] == 13) {
+          num_events_nonREM <- num_events_nonREM + 1
+        }
+      }
+      # regardless, choose the next stage based on an event currently happening
+      if (sleep_stage_sim[curr_epoch] == 12) {
+        sleep_stage_sim[curr_epoch + 1] <-
+          sample(x=c(11,12,13), size=1, prob=REM_transition_prob_event)
+      }
+      else if (sleep_stage_sim[curr_epoch] == 13) {
+        sleep_stage_sim[curr_epoch + 1] <-
+          sample(x=c(11,12,13), size=1, prob=nonREM_transition_prob_event)
+      }
+      curr_epoch <- curr_epoch + 1
+    }
+    
+    # If the event ended in the previous epoch:
+    # First, simulate an event from the end of the previous one based on the previous sleep stage.
+    # Then, evaluate whether anything further needs to be done. (If the event starts after the start
+    # of the next epoch and the sleep stage changed.)
+    if (ceiling(next_event_end / 30) < curr_epoch) {
+      if (sleep_stage_sim[curr_epoch-1] == 12) {
+        next_event_start <- next_event_end + REM_interevent_times_latent[REM_event_index]
+        next_event_end <- next_event_start + REM_durations_latent[REM_event_index]
+        REM_event_index <- REM_event_index + 1
+        # check if the next event starts in the previous epoch, and increment the counter accordingly
+        if (ceiling(next_event_start / 30) < curr_epoch) {
+          num_events_REM <- num_events_REM + 1
+        }
+        # check that the new event actually crossed into the new epoch or beyond
+        while (ceiling(next_event_end / 30) < curr_epoch) {
+          next_event_start <- next_event_end + REM_interevent_times_latent[REM_event_index]
+          if (ceiling(next_event_start / 30) < curr_epoch) {
+            num_events_REM <- num_events_REM + 1
+          }
+          next_event_end <- next_event_start + REM_durations_latent[REM_event_index]
+          REM_event_index <- REM_event_index + 1
+        }
+      }
+      else if (sleep_stage_sim[curr_epoch-1] == 13) {
+        next_event_start <- next_event_end + nonREM_interevent_times_latent[nonREM_event_index]
+        next_event_end <- next_event_start + nonREM_durations_latent[nonREM_event_index]
+        nonREM_event_index <- nonREM_event_index + 1
+        # check if the next event starts in the previous epoch, and increment the counter accordingly
+        if (ceiling(next_event_start / 30) < curr_epoch) {
+          num_events_nonREM <- num_events_nonREM + 1
+        }
+        # check that the new event actually crossed into the new epoch or beyond
+        while (ceiling(next_event_end / 30) < curr_epoch) {
+          next_event_start <- next_event_end + nonREM_interevent_times_latent[nonREM_event_index]
+          if (ceiling(next_event_start / 30) < curr_epoch) {
+            num_events_nonREM <- num_events_nonREM + 1
+          }
+          next_event_end <- next_event_start + nonREM_durations_latent[nonREM_event_index]
+          nonREM_event_index <- nonREM_event_index + 1
+        }
+      }
+      if (ceiling(next_event_start / 30) >= curr_epoch &
+          sleep_stage_sim[curr_epoch] != sleep_stage_sim[curr_epoch-1]) {
+        if (sleep_stage_sim[curr_epoch] == 12) {
+          next_event_start <- (curr_epoch-1) * 30 + REM_interevent_times_latent[REM_event_index]
+          next_event_end <- next_event_start + REM_durations_latent[REM_event_index]
+          REM_event_index <- REM_event_index + 1
+        }
+        else if (sleep_stage_sim[curr_epoch] == 13) {
+          next_event_start <- (curr_epoch-1) * 30 + nonREM_interevent_times_latent[nonREM_event_index]
+          next_event_end <- next_event_start + nonREM_durations_latent[nonREM_event_index]
+          nonREM_event_index <- nonREM_event_index + 1
+        }
+      }
+    }
+    
+    # generate a new event if the patient woke up
+    if (sleep_stage_sim[curr_epoch] == 11) {
+      sleep_stage_sim[curr_epoch] <- sample(starting_stage_vec, size=1)
+      if (sleep_stage_sim[curr_epoch] == 12) {
+        next_event_start <- (curr_epoch-1) * 30 + REM_interevent_times_latent[REM_event_index]
+        next_event_end <- next_event_start + REM_durations_latent[REM_event_index]
+        REM_event_index <- REM_event_index + 1
+      }
+      else if (sleep_stage_sim[curr_epoch] == 13) {
+        next_event_start <- (curr_epoch-1) * 30 + nonREM_interevent_times_latent[nonREM_event_index]
+        next_event_end <- next_event_start + nonREM_durations_latent[nonREM_event_index]
+        nonREM_event_index <- nonREM_event_index + 1
+      }
+    }
+  }
+  
+  # Now, return the desired output based on the simulated data
+  epochs_in_REM <- sum(sleep_stage_sim == 12)
+  epochs_in_nonREM <- sum(sleep_stage_sim == 13)
+  
+  return(list(epochs_in_REM, epochs_in_nonREM, num_events_REM, num_events_nonREM))
+}
+```
+
+
+
+sim_night <- function(fixed_vec,
+                      random_vec,
+                      starting_stage_vec,
+                      event_durations_REM_vec,
+                      event_durations_nonREM_vec,
+                      epochs_asleep)
+                      
+```{r}
+# try running for the first sample for the first patient
+sim_night(fixed_vec=fixed_effect_samples[1,],
+          random_vec=random_effect_samples[1,1,],
+          starting_stage_vec=pp_check_vecs$starting_stage_vec[[1]],
+          event_durations_REM_vec=pp_check_vecs$event_durations_REM_vec[[1]],
+          event_durations_nonREM_vec=pp_check_vecs$event_durations_nonREM_vec[[1]],
+          epochs_asleep=(df_figures$total_sleep[1] * 3600 / 30))
+
+```
+
+
+
+```{r}
+# create storage for each of the values returned (using a thin of 10 for now)
+epochs_in_REM_mat <- matrix(nrow=1000, ncol=1093)
+epochs_in_nonREM_mat <- matrix(nrow=1000, ncol=1093)
+num_events_REM_mat <- matrix(nrow=1000, ncol=1093)
+num_events_nonREM_mat <- matrix(nrow=1000, ncol=1093)
+
+# loop over samples and patients to populate them
+for (i in 1:1093) {
+  print(paste0("Starting patient ", i, "!"))
+  for (j in seq(1,10000,10)) {
+    curr_sim <- sim_night(fixed_vec=fixed_effect_samples[j,],
+                          random_vec=random_effect_samples[j,i,],
+                          starting_stage_vec=pp_check_vecs$starting_stage_vec[[i]],
+                          event_durations_REM_vec=pp_check_vecs$event_durations_REM_vec[[i]],
+                          event_durations_nonREM_vec=pp_check_vecs$event_durations_nonREM_vec[[i]],
+                          epochs_asleep=(df_figures$total_sleep[i] * 3600 / 30))
+    epochs_in_REM_mat[ceiling(j/10),i] <- curr_sim[[1]]
+    epochs_in_nonREM_mat[ceiling(j/10),i] <- curr_sim[[2]]
+    num_events_REM_mat[ceiling(j/10),i] <- curr_sim[[3]]
+    num_events_nonREM_mat[ceiling(j/10),i] <- curr_sim[[4]]
+  }
+}
+```
+
+
+```{r}
+# make dataframes for plotting
+
+# time in REM sleep (hours)
+time_in_REM_df <- data.frame(1:1093,
+                             apply(epochs_in_REM_mat, 2, mean) * 30 / 3600,
+                             apply(epochs_in_REM_mat, 2, quantile, 0.025) * 30 / 3600,
+                             apply(epochs_in_REM_mat, 2, quantile, 0.975) * 30 / 3600,
+                             df_figures$time_in_REM)
+names(time_in_REM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+# time in non-REM sleep (hours)
+time_in_nonREM_df <- data.frame(1:1093,
+                             apply(epochs_in_nonREM_mat, 2, mean) * 30 / 3600,
+                             apply(epochs_in_nonREM_mat, 2, quantile, 0.025) * 30 / 3600,
+                             apply(epochs_in_nonREM_mat, 2, quantile, 0.975) * 30 / 3600,
+                             df_figures$time_in_nonREM)
+names(time_in_nonREM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+# event count in REM sleep
+events_in_REM_df <- data.frame(1:1093,
+                               apply(num_events_REM_mat, 2, mean),
+                               apply(num_events_REM_mat, 2, quantile, 0.025),
+                               apply(num_events_REM_mat, 2, quantile, 0.975),
+                               df_figures$num_events_REM)
+names(events_in_REM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+# event count in non-REM sleep
+events_in_nonREM_df <- data.frame(1:1093,
+                               apply(num_events_nonREM_mat, 2, mean),
+                               apply(num_events_nonREM_mat, 2, quantile, 0.025),
+                               apply(num_events_nonREM_mat, 2, quantile, 0.975),
+                               df_figures$num_events_nonREM)
+names(events_in_nonREM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+# REM AHI
+AHI_REM_mat <- num_events_REM_mat / (epochs_in_REM_mat * 30 / 3600)
+AHI_REM_df <- data.frame(1:1093,
+                               apply(AHI_REM_mat, 2, mean, na.rm=TRUE),
+                               apply(AHI_REM_mat, 2, quantile, probs=0.025, na.rm=TRUE),
+                               apply(AHI_REM_mat, 2, quantile, probs=0.975, na.rm=TRUE),
+                               df_figures$AHI_REM)
+names(AHI_REM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+# non-REM AHI
+AHI_nonREM_mat <- num_events_nonREM_mat / (epochs_in_nonREM_mat * 30 / 3600)
+AHI_nonREM_df <- data.frame(1:1093,
+                               apply(AHI_nonREM_mat, 2, mean, na.rm=TRUE),
+                               apply(AHI_nonREM_mat, 2, quantile, probs=0.025, na.rm=TRUE),
+                               apply(AHI_nonREM_mat, 2, quantile, probs=0.975, na.rm=TRUE),
+                               df_figures$AHI_nonREM)
+names(AHI_nonREM_df) <- c("ID", "mean", "lower", "upper", "true")
+
+```
+
+```{r}
+# add sorted indices
+
+# time in REM
+time_in_REM_df <- time_in_REM_df |>
+  arrange(true,mean)
+time_in_REM_df$sorted_index <- 1:1093
+
+# time in non-REM
+time_in_nonREM_df <- time_in_nonREM_df |>
+  arrange(true,mean)
+time_in_nonREM_df$sorted_index <- 1:1093
+
+# events in REM
+events_in_REM_df <- events_in_REM_df |>
+  arrange(true,mean)
+events_in_REM_df$sorted_index <- 1:1093
+
+# events in non-REM
+events_in_nonREM_df <- events_in_nonREM_df |>
+  arrange(true,mean)
+events_in_nonREM_df$sorted_index <- 1:1093
+
+# AHI REM
+AHI_REM_df <- AHI_REM_df |>
+  arrange(true,mean)
+AHI_REM_df$sorted_index <- 1:1093
+
+# AHI non-REM
+AHI_nonREM_df <- AHI_nonREM_df |>
+  arrange(true,mean)
+AHI_nonREM_df$sorted_index <- 1:1093
+
+```
+
+```{r}
+# make interval plots -- hopefully visible with all patients?
+
+# time in REM
+ggplot(data=time_in_REM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive time spent in REM sleep",
+       x="Patient index (sorted by true time in REM)",
+       y="Time in REM sleep (hours)")
+
+# time in nonREM
+ggplot(data=time_in_nonREM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive time spent in non-REM sleep",
+       x="Patient index (sorted by true time in non-REM)",
+       y="Time in non-REM sleep (hours)")
+
+# events in REM
+ggplot(data=events_in_REM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive event count in REM sleep",
+       x="Patient index (sorted by true event count in REM)",
+       y="Events during REM sleep")
+
+# events in nonREM
+ggplot(data=events_in_nonREM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive event count in non-REM sleep",
+       x="Patient index (sorted by true event count in non-REM)",
+       y="Events during non-REM sleep")
+
+# AHI in REM
+ggplot(data=AHI_REM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive AHI during REM sleep",
+       x="Patient index (sorted by true REM AHI)",
+       y="AHI during REM sleep")
+
+# AHI in non-REM
+ggplot(data=AHI_nonREM_df, aes(x=sorted_index, y=true)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), color="blue") +
+  geom_point(aes(y=mean), color="darkorange") +
+  geom_point() +
+  labs(title="Posterior predictive AHI during non-REM sleep",
+       x="Patient index (sorted by true non-REM AHI)",
+       y="AHI during non-REM sleep")
+
+```
+
+```{r}
+# compute coverage
+
+sum(time_in_REM_df$upper > time_in_REM_df$true &
+      time_in_REM_df$lower < time_in_REM_df$true) / 1093
+
+sum(time_in_nonREM_df$upper > time_in_nonREM_df$true &
+      time_in_nonREM_df$lower < time_in_nonREM_df$true) / 1093
+
+sum(events_in_REM_df$upper > events_in_REM_df$true &
+      events_in_REM_df$lower < events_in_REM_df$true) / 1093
+
+sum(events_in_nonREM_df$upper > events_in_nonREM_df$true &
+      events_in_nonREM_df$lower < events_in_nonREM_df$true) / 1093
+
+sum(AHI_REM_df$upper > AHI_REM_df$true &
+      AHI_REM_df$lower < AHI_REM_df$true) / 1093
+
+sum(AHI_nonREM_df$upper > AHI_nonREM_df$true &
+      AHI_nonREM_df$lower < AHI_nonREM_df$true) / 1093
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
