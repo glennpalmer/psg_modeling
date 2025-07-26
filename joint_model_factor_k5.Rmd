@@ -940,6 +940,25 @@ for (l in 1:m) {
 theta_postmean <- apply(theta_samples, c(2,1), mean)
 ```
 
+```{r}
+# make elbow plot to choose number of clusters -- looks like 4
+
+# Initialize an empty vector to store WCSS values
+wcss_values <- c()
+
+# Loop through a range of k values
+for (k in 1:10) {
+  kmeans_model <- kmeans(theta_postmean, centers = k)
+  wcss_values <- c(wcss_values, kmeans_model$tot.withinss)
+}
+
+# Create the elbow plot
+plot(1:10, wcss_values, type = "b",
+     xlab = "Number of Clusters (k)",
+     ylab = "Total Within-Cluster Sum of Squares (WCSS)",
+     main = "Elbow Plot for K-Means Clustering")
+```
+
 
 ```{r}
 ##### get cluster labels (Bayes optimal)
