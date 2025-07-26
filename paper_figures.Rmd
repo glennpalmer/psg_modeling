@@ -838,58 +838,195 @@ ggplot(df_figures, aes(x=time_in_REM, y=time_in_nonREM, color=cluster)) +
 
 
 
-# Regression of pathfinder and bsrt on cluster
+# Regression of bsrt on clusters
 
 
 ```{r}
-df_pfn <- df_figures |>
-  filter(PFNTOTL > 0)
-df_pfn <- within(df_pfn, cluster <- relevel(cluster, ref=4))
-summary(lm(PFNTOTL ~ cluster + age_at_enrollment + isMale, data=df_pfn))
-
 df_bsrt <- df_figures |>
   filter(BSRT_SumRecall > 0)
 df_bsrt <- within(df_bsrt, cluster <- relevel(cluster, ref=4))
-summary(lm(BSRT_SumRecall ~ cluster + age_at_enrollment + isMale, data=df_bsrt))
 ```
 
 ```{r}
-# compared to the same regressions on AHI
+# outcome 
+BSRT_score <- df_bsrt$BSRT_SumRecall
 
-summary(lm(PFNTOTL ~ age_at_enrollment + isMale + AHI, data=df_pfn))
+# covariates
+age <- df_bsrt$age_at_enrollment
+isMale <- df_bsrt$isMale
+cluster1 <- (df_bsrt$cluster == "1")
+cluster2 <- (df_bsrt$cluster == "2")
+cluster3 <- (df_bsrt$cluster == "3")
+AHI <- df_bsrt$AHI
+```
 
-summary(lm(BSRT_SumRecall ~ AHI + age_at_enrollment + isMale, data=df_bsrt))
+Fit model for BSRT regressed on clusters:
+
+```{r}
+# load stan model
+bsrt_model_cluster <-
+  stan_model("bsrt_cluster_linreg.stan")
+
+# fit model
+
+N <- length(BSRT_score)
+coef_prior_sd <- 100;
+options(mc.cores = parallel::detectCores())
+bsrt_fit <- sampling(bsrt_model_cluster,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=BSRT_score,
+                            age=age,
+                            sexMale=isMale,
+                            cluster1=cluster1,
+                            cluster2=cluster2,
+                            cluster3=cluster3),
+                       iter=2000)
+
+
+
+```
+
+```{r}
+# extract posterior samples and summarize
+post_samples_bsrt <- extract(bsrt_fit)
+```
+
+```{r}
+# posterior means
+mean(post_samples_bsrt$intercept)
+mean(post_samples_bsrt$beta_cluster1)
+mean(post_samples_bsrt$beta_cluster2)
+mean(post_samples_bsrt$beta_cluster3)
+mean(post_samples_bsrt$beta_age)
+mean(post_samples_bsrt$beta_sexMale)
+```
+```{r}
+# 95% credible intervals
+quantile(post_samples_bsrt$intercept, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster1, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster2, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster3, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_sexMale, probs=c(0.025,0.975))
 ```
 
 
+And for BSRT regressed on AHI.
+
 
 ```{r}
-##### cluster by time and AHI in REM and non-REM
+# load stan model
+bsrt_model_ahi <-
+  stan_model("bsrt_ahi_linreg.stan")
 
-alt_cluster_mat <- matrix(data=c(df_figures$AHI_REM,
-                                 df_figures$AHI_nonREM,
-                                 df_figures$time_in_REM,
-                                 df_figures$time_in_nonREM),
-                          ncol=4)
+# fit model
+
+N <- length(BSRT_score)
+coef_prior_sd <- 100;
+options(mc.cores = parallel::detectCores())
+bsrt_fit_ahi <- sampling(bsrt_model_ahi,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=BSRT_score,
+                            age=age,
+                            sexMale=isMale,
+                            AHI=AHI),
+                       iter=2000)
 
 
-# run k-means using posterior means
-alt_clusters <- kmeans(alt_cluster_mat, centers=4, nstart=50)
-alt_cluster_labels <- as.factor(alt_clusters$cluster)
-alt_cluster_labels
-alt_clusters$size
-alt_clusters$centers
+
+```
+
+```{r}
+# extract posterior samples and summarize
+post_samples_bsrt <- extract(bsrt_fit_ahi)
+```
+
+```{r}
+# posterior means
+mean(post_samples_bsrt$intercept)
+mean(post_samples_bsrt$beta_AHI)
+mean(post_samples_bsrt$beta_age)
+mean(post_samples_bsrt$beta_sexMale)
 ```
 
 
 ```{r}
-# add the alt clusters to the data and try regression
-df_figures$alt_cluster_labels <- alt_cluster_labels
+# 95% credible intervals
+quantile(post_samples_bsrt$intercept, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_AHI, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_sexMale, probs=c(0.025,0.975))
+```
+
+
+And finally, for the alternate clusters
+
+
+```{r}
+# outcome 
+BSRT_score <- df_bsrt$BSRT_SumRecall
+
+# covariates
+age <- df_bsrt$age_at_enrollment
+isMale <- df_bsrt$isMale
+cluster1_alt <- (df_bsrt$alt_cluster_labels == "1")
+cluster2_alt <- (df_bsrt$alt_cluster_labels == "2")
+cluster3_alt <- (df_bsrt$alt_cluster_labels == "3")
+AHI <- df_bsrt$AHI
+```
+
+
+```{r}
+# load stan model
+bsrt_model_cluster <-
+  stan_model("bsrt_cluster_linreg.stan")
+
+# fit model
+
+N <- length(BSRT_score)
+coef_prior_sd <- 100;
+options(mc.cores = parallel::detectCores())
+bsrt_fit <- sampling(bsrt_model_cluster,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=BSRT_score,
+                            age=age,
+                            sexMale=isMale,
+                            cluster1=cluster1_alt,
+                            cluster2=cluster2_alt,
+                            cluster3=cluster3_alt),
+                       iter=2000)
+
+
+
+```
+
+
+```{r}
+# extract posterior samples and summarize
+post_samples_bsrt <- extract(bsrt_fit)
 ```
 
 ```{r}
-df_figures_lm <- within(df_figures, alt_cluster_labels <- relevel(alt_cluster_labels, ref=4))
-summary(lm(BSRT_SumRecall ~ age_at_enrollment + sex + alt_cluster_labels, data=df_figures_lm))
+# posterior means
+mean(post_samples_bsrt$intercept)
+mean(post_samples_bsrt$beta_cluster1)
+mean(post_samples_bsrt$beta_cluster2)
+mean(post_samples_bsrt$beta_cluster3)
+mean(post_samples_bsrt$beta_age)
+mean(post_samples_bsrt$beta_sexMale)
+```
+
+```{r}
+# 95% credible intervals
+quantile(post_samples_bsrt$intercept, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster1, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster2, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_cluster3, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_bsrt$beta_sexMale, probs=c(0.025,0.975))
 ```
 
 
@@ -901,8 +1038,6 @@ ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=alt_cluster_labels)) +
        x="pc1",
        color="cluster")
 ```
-
-
 
 
 
