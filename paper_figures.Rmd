@@ -9,6 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(Hmisc)
+library(latex2exp)
 ```
 
 First, I prep the data in the next four sections. Then, I make relevant tables and figures.
@@ -608,7 +609,10 @@ fviz_eig(theta_pca, addlabels=TRUE,
 ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=cluster)) +
   geom_point() +
   labs(title="Bayes-optimal clustering",
-       x="pc1")
+       x="pc1",
+       y=TeX(r"($\phi_{R}$)")) +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=18))
 ```
 
 ```{r}
@@ -616,9 +620,12 @@ ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=cluster)) +
 ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster1prob)) +
   geom_point() +
   labs(title="Probability of being in cluster 1",
-       x="pc1") +
+       x="pc1",
+       y=TeX(r"($\phi_R$)")) +
   scale_color_continuous(type="viridis", limits=c(0,1)) +
-  theme(legend.title=element_blank())
+  theme(legend.title=element_blank(),
+        axis.title.y = element_text(size=18),
+        axis.title.x = element_text(size=16))
 
 ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=type1_cluster2prob)) +
   geom_point() +
@@ -836,6 +843,45 @@ ggplot(df_figures, aes(x=time_in_REM, y=time_in_nonREM, color=cluster)) +
 ```
 
 
+# Alternate clusters
+
+```{r}
+##### cluster by time and AHI in REM and non-REM
+set.seed(12341)
+alt_cluster_mat <- matrix(data=c(df_figures$AHI_REM,
+                                 df_figures$AHI_nonREM,
+                                 df_figures$time_in_REM,
+                                 df_figures$time_in_nonREM),
+                          ncol=4)
+
+
+# run k-means using posterior means
+alt_clusters <- kmeans(alt_cluster_mat, centers=4, nstart=50)
+alt_cluster_labels <- as.factor(alt_clusters$cluster)
+alt_cluster_labels
+alt_clusters$size
+alt_clusters$centers
+```
+
+
+```{r}
+# add the alt clusters to the data
+df_figures$alt_cluster_labels <- alt_cluster_labels
+```
+
+
+```{r}
+# plot alternate clusters on scatterplot of principal components
+ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=alt_cluster_labels)) +
+  geom_point() +
+  labs(title="Alternate simple clustering",
+       x="pc1",
+       color="cluster",
+       y=TeX(r"($\phi_{R}$)")) +
+  theme(axis.title.x = element_text(size=16),
+        axis.title.y = element_text(size=18))
+```
+
 
 
 # Regression of bsrt on clusters
@@ -1037,6 +1083,215 @@ ggplot(df_figures, aes(x=pc1_dynamics, y=phi_R, color=alt_cluster_labels)) +
   labs(title="Alternate simple clustering",
        x="pc1",
        color="cluster")
+```
+
+
+# Regression of pathfinder on clusters
+
+```{r}
+df_pathfinder <- df_figures |>
+  filter(PFNTOTL > 0)
+
+df_pathfinder$cluster <- relevel(df_pathfinder$cluster, ref="4")
+```
+
+```{r}
+# outcome 
+Pathfinder_score <- df_pathfinder$PFNTOTL
+
+# covariates
+age <- df_pathfinder$age_at_enrollment
+isMale <- df_pathfinder$isMale
+cluster1 <- (df_pathfinder$cluster == "1")
+cluster2 <- (df_pathfinder$cluster == "2")
+cluster3 <- (df_pathfinder$cluster == "3")
+AHI <- df_pathfinder$AHI
+```
+
+
+Fit model for Pathfinder regressed on clusters:
+
+
+```{r}
+# outcome 
+Pathfinder_score <- df_pathfinder$PFNTOTL
+
+# covariates
+age <- df_pathfinder$age_at_enrollment
+isMale <- df_pathfinder$isMale
+cluster1 <- (df_pathfinder$cluster == "1")
+cluster2 <- (df_pathfinder$cluster == "2")
+cluster3 <- (df_pathfinder$cluster == "3")
+AHI <- df_pathfinder$AHI
+```
+
+```{r}
+# load stan model
+pathfinder_model_cluster <-
+  stan_model("bsrt_cluster_linreg.stan")
+
+# fit model
+
+N <- length(Pathfinder_score)
+coef_prior_sd <- 100;
+options(mc.cores = parallel::detectCores())
+pathfinder_fit <- sampling(bsrt_model_cluster,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=Pathfinder_score,
+                            age=age,
+                            sexMale=isMale,
+                            cluster1=cluster1,
+                            cluster2=cluster2,
+                            cluster3=cluster3),
+                       iter=2000)
+
+
+
+```
+
+
+```{r}
+# extract posterior samples and summarize
+post_samples_pathfinder <- extract(pathfinder_fit)
+```
+
+```{r}
+# posterior means
+mean(post_samples_pathfinder$intercept)
+mean(post_samples_pathfinder$beta_cluster1)
+mean(post_samples_pathfinder$beta_cluster2)
+mean(post_samples_pathfinder$beta_cluster3)
+mean(post_samples_pathfinder$beta_age)
+mean(post_samples_pathfinder$beta_sexMale)
+```
+```{r}
+# 95% credible intervals
+quantile(post_samples_pathfinder$intercept, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster1, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster2, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster3, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_sexMale, probs=c(0.025,0.975))
+```
+
+
+And for Pathfinder regressed on AHI.
+
+
+```{r}
+# load stan model
+bsrt_model_ahi <-
+  stan_model("bsrt_ahi_linreg.stan")
+
+# fit model
+
+N <- length(Pathfinder_score)
+coef_prior_sd <- 100
+options(mc.cores = parallel::detectCores())
+pathfinder_fit_ahi <- sampling(bsrt_model_ahi,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=Pathfinder_score,
+                            age=age,
+                            sexMale=isMale,
+                            AHI=AHI),
+                       iter=2000)
+
+
+
+```
+
+
+```{r}
+# extract posterior samples and summarize
+post_samples_pathfinder <- extract(pathfinder_fit_ahi)
+```
+
+```{r}
+# posterior means
+mean(post_samples_pathfinder$intercept)
+mean(post_samples_pathfinder$beta_AHI)
+mean(post_samples_pathfinder$beta_age)
+mean(post_samples_pathfinder$beta_sexMale)
+```
+
+
+```{r}
+# 95% credible intervals
+quantile(post_samples_pathfinder$intercept, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_AHI, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_sexMale, probs=c(0.025,0.975))
+```
+
+
+And finally, for the alternate clusters
+
+
+```{r}
+# outcome 
+Pathfinder_score <- df_pathfinder$PFNTOTL
+
+# covariates
+age <- df_pathfinder$age_at_enrollment
+isMale <- df_pathfinder$isMale
+cluster1_alt <- (df_pathfinder$alt_cluster_labels == "1")
+cluster2_alt <- (df_pathfinder$alt_cluster_labels == "2")
+cluster3_alt <- (df_pathfinder$alt_cluster_labels == "3")
+AHI <- df_pathfinder$AHI
+```
+
+
+```{r}
+# load stan model
+bsrt_model_cluster <-
+  stan_model("bsrt_cluster_linreg.stan")
+
+# fit model
+
+N <- length(Pathfinder_score)
+coef_prior_sd <- 100;
+options(mc.cores = parallel::detectCores())
+pathfinder_fit <- sampling(bsrt_model_cluster,
+                       list(N=N,
+                            coef_prior_sd=coef_prior_sd,
+                            bsrt=Pathfinder_score,
+                            age=age,
+                            sexMale=isMale,
+                            cluster1=cluster1_alt,
+                            cluster2=cluster2_alt,
+                            cluster3=cluster3_alt),
+                       iter=2000)
+
+
+
+```
+
+
+```{r}
+# extract posterior samples and summarize
+post_samples_pathfinder <- extract(pathfinder_fit)
+```
+
+```{r}
+# posterior means
+mean(post_samples_pathfinder$intercept)
+mean(post_samples_pathfinder$beta_cluster1)
+mean(post_samples_pathfinder$beta_cluster2)
+mean(post_samples_pathfinder$beta_cluster3)
+mean(post_samples_pathfinder$beta_age)
+mean(post_samples_pathfinder$beta_sexMale)
+```
+
+```{r}
+# 95% credible intervals
+quantile(post_samples_pathfinder$intercept, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster1, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster2, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_cluster3, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_age, probs=c(0.025,0.975))
+quantile(post_samples_pathfinder$beta_sexMale, probs=c(0.025,0.975))
 ```
 
 

@@ -19,7 +19,7 @@ library(chron)
 library(edfReader)
 library(xtable)
 library(stats)
-library(infinitefactor)
+#library(infinitefactor)
 library(coda)
 library(sns)
 ```
@@ -686,7 +686,30 @@ corr_mat
 ```{r}
 # plot the correlation matrix -- SELF: should white out any where the 95% CI includes zero
 ggcorrplot(corr_mat,
-           colors = c("blue", "white", "darkorange2"))
+           colors = c("blue", "white", "darkorange2")) +
+  scale_x_discrete(labels=unname(TeX(c(r"($\gamma_{RA}$)",
+                                       r"($\alpha_{RA}$)",
+                                       r"($\gamma_{RN}$)",
+                                       r"($\alpha_{RN}$)",
+                                       r"($\gamma_{NR}$)",
+                                       r"($\alpha_{NR}$)",
+                                       r"($\gamma_{N A}$)",
+                                       r"($\alpha_{N A}$)",
+                                       r"($\phi_R$)",
+                                       r"($\phi_N$)")))) +
+  scale_y_discrete(labels=unname(TeX(c(r"($\gamma_{RA}$)",
+                                       r"($\alpha_{RA}$)",
+                                       r"($\gamma_{RN}$)",
+                                       r"($\alpha_{RN}$)",
+                                       r"($\gamma_{NR}$)",
+                                       r"($\alpha_{NR}$)",
+                                       r"($\gamma_{N A}$)",
+                                       r"($\alpha_{N A}$)",
+                                       r"($\phi_R$)",
+                                       r"($\phi_N$)")))) +
+  theme(axis.text.x = element_text(size=18),
+        axis.text.y = element_text(size=18))
+  
 ```
 
 ```{r}
@@ -786,7 +809,11 @@ ggplot(data=rate_main_df, aes(x=parameter, y=posterior_mean)) +
   geom_point(color="red") +
   coord_flip() +
   labs(title="Inter-event time model fixed effects",
-       x="", y="")
+       x="", y="") +
+  theme(axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16)) +
+  scale_x_discrete(labels=unname(TeX(c(r"($\lambda_{N}$)",
+                                       r"($\lambda_{R}$)"))))
 
 ```
 
@@ -811,7 +838,11 @@ ggplot(data=rate_re_var_df, aes(x=parameter, y=posterior_mean)) +
   geom_point(color="red") +
   coord_flip() +
   labs(title="Inter-event time model random effect variances",
-       x="", y="")
+       x="", y="") +
+  theme(axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16)) +
+  scale_x_discrete(labels=unname(TeX(c(r"(var($\phi_{N}$))",
+                                       r"(var($\phi_{R}$))"))))
 
 ```
 
@@ -851,7 +882,17 @@ ggplot(data=maineffect_df, aes(x=parameter, y=posterior_mean)) +
   coord_flip() +
   labs(title="Markov transition model fixed effects",
        subtitle="mus are transition effects; taus are shifts by apnea event",
-       x="", y="")
+       x="", y="") +
+  scale_x_discrete(labels=unname(TeX(c(r"($\tau_{RN}$)",
+                                       r"($\tau_{RA}$)",
+                                       r"($\tau_{NR}$)",
+                                       r"($\tau_{N A}$)",
+                                       r"($\mu_{RN}$)",
+                                       r"($\mu_{RA}$)",
+                                       r"($\mu_{NR}$)",
+                                       r"($\mu_{N A}$)")))) +
+  theme(axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16))
 
 ```
 
@@ -905,7 +946,17 @@ ggplot(data=rate_re_var_df, aes(x=parameter_label, y=posterior_mean)) +
   coord_flip() +
   labs(title="Markov transition model random effect variances",
        subtitle="gammas are transition effects; alphas are shifts by apnea event",
-       x="", y="")
+       x="", y="") +
+  scale_x_discrete(labels=unname(TeX(c(r"(var($\alpha_{RN}$))",
+                                       r"(var($\alpha_{RA}$))",
+                                       r"(var($\alpha_{NR}$))",
+                                       r"(var($\alpha_{N A}$))",
+                                       r"(var($\gamma_{RN}$))",
+                                       r"(var($\gamma_{RA}$))",
+                                       r"(var($\gamma_{NR}$))",
+                                       r"(var($\gamma_{N A}$))")))) +
+  theme(axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16))
 
 ```
 
@@ -964,6 +1015,7 @@ plot(1:10, wcss_values, type = "b",
 ##### get cluster labels (Bayes optimal)
 
 # run k-means using posterior means
+set.seed(1239)
 k <- 4
 km.out.bayes4 <- kmeans(theta_postmean, centers=k, nstart=50)
 label_init <- km.out.bayes4$cluster
