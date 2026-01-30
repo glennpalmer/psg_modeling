@@ -12,5 +12,5 @@ The R markdown notebooks and R files in the main directory and listed below can 
 * `paper_figures.Rmd`: Using output from the above, generates the remaining figures and table results in the paper.
 * `posterior_predictive_checks.Rmd`: Using the fitted model, performs the posterior predictive checks summarized in the paper and supplement.
 * `clustering_supplement.Rmd`: Using the fitted model, performs and summarizes the additional clustering methodology shown in the supplement.
-* `simulation_scenario[1-3].R`: Scripts that generate synthetic polysomnogram summaries, fit the model to them, and save results.
+* `simulation_scenario[1-3].R`: Scripts that generate synthetic polysomnogram summaries based on the scenario 1, 2, and 3 simulations described in the paper, fit the model to them, and save results.
 
