@@ -1,6 +1,8 @@
 # psg_modeling
 
-This repository contains code that generates the results from the paper: G. Palmer, D.B. Dunson (2025+) 'Quantifying sleep apnea heterogeneity using hierarchical Bayesian modeling', as well as a Stan model implementing our approach that can be used for other data sets. For an example of how to clean and process PSG data to be compatible with the Stan model, see the code in `joint_model_factor.Rmd`.
+This repository contains code that generates the results from the paper: G. Palmer, D.B. Dunson (2025+) 'Quantifying sleep apnea heterogeneity using hierarchical Bayesian modeling', as well as a Stan model implementing our approach that can be used for other data sets. 
+
+For an example of how to clean and process PSG data to be compatible with the Stan model, see the code in `joint_model_factor.Rmd`.
 
 If you have any questions, find bugs, etc. please reach out to glennpalmer55@gmail.com.
 
