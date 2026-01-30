@@ -2,7 +2,7 @@
 
 This repository contains code that generates the results from the paper: G. Palmer, D.B. Dunson (2025+) 'Quantifying sleep apnea heterogeneity using hierarchical Bayesian modeling', as well as a Stan model implementing our approach that can be used for other data sets.
 
-If you have any questions, find bugs, etc. please reach out to glenn.palmer@duke.edu.
+If you have any questions, find bugs, etc. please reach out to glennpalmer55@gmail.com.
 
 # Code for results in paper
 
